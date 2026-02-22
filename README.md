@@ -1,4 +1,4 @@
-# opencode-architect-plugin
+# effective-opencode
 
 An [opencode](https://github.com/anomalyco/opencode) plugin that enables two AI software architects to pair program on your design problems — debating, critiquing, and iterating to consensus before implementation begins.
 
@@ -55,13 +55,15 @@ bun install
   "plugin": [
     "file://./src/index.ts"
   ],
-  "architectPlugin": {
+  "effectiveOpencode": {
     "maxRounds": 3,
     "retainSessions": false,
-    "timeoutMs": 120000
+    "timeoutMs": 300000
   }
 }
 ```
+
+> The legacy `architectPlugin` key is also accepted for backwards compatibility.
 
 ### 3. Start opencode
 
@@ -69,11 +71,18 @@ bun install
 opencode
 ```
 
-The `architect` tool is now available in your session.
+The `architect` and `refactor` tools are now available in your session.
 
-## Usage
+## Tools
 
-Simply describe what you want to build. The LLM will automatically call the `architect` tool when it determines an architectural design session would be valuable.
+### `architect`
+
+Runs a two-agent debate to produce an architectural design. Simply describe what you want to build — the LLM will call the tool when a design session would be valuable.
+
+**Parameters:**
+- `vision` — your requirement or task description (required)
+- `max_rounds` — override the maximum debate rounds for this run (optional)
+- `execution_mode` — `"debate"` (default) or `"improvement-audit"`
 
 **Example prompts:**
 
@@ -85,13 +94,17 @@ Design a plugin system for a CLI tool that supports hot-reload and typed configu
 I need to add real-time collaboration to our editor. How should we architect the sync layer?
 ```
 
-```
-Plan the architecture for a multi-tenant API with per-tenant rate limiting and audit logs.
-```
+### `refactor`
 
-The tool accepts:
-- `vision` — your requirement or task description (required)
-- `max_rounds` — override the maximum debate rounds for this session (optional)
+Generates file scaffolding from a design string and supports preview/apply/rollback.
+
+**Actions:** `generate`, `preview`, `apply`, `rollback`, `list`, `generate-tests`, `apply-tests`
+
+**Parameters:**
+- `design` — description of the desired file structure or code changes (required)
+- `action` — one of the actions above (required)
+- `base_dir` — root directory for scaffolding (optional)
+- `checkpoint_id` — for rollback/apply (optional)
 
 ## How It Works
 
@@ -120,6 +133,18 @@ Verdicts are parsed from fenced `json:verdict` blocks in the Critic's response:
 
 A keyword fallback (`APPROVED: ...`) handles cases where the model doesn't produce valid JSON.
 
+### Session Lifecycle & Permission Safety
+
+Each architect invocation creates a **run-scoped** pair of sub-sessions:
+
+1. `ArchitectRunScopeManager.startRun(rootSessionID)` opens a fresh isolated scope.
+2. `runDebate` creates proposer and critic sessions in parallel, registering each via an `onSessionCreated` callback that calls `scopeManager.attachSession(runId, sessionID)`.
+3. If attachment fails (e.g. duplicate session ID), `runDebate` throws immediately — no partially-attached sessions are left in the permission set.
+4. The `permission.ask` and `permission.updated` hooks use a single canonical predicate `isAutoApprovableSession(id)` (backed by `scopeManager.isKnownSession`) to auto-approve tool calls from architect sub-sessions.
+5. `endRun` in `finally` atomically removes all run sessions from the scope manager, revoking auto-approval.
+
+This design prevents cross-run session bleed when multiple architect runs execute concurrently.
+
 ### Project Context
 
 Before the debate begins, the plugin collects context from your codebase:
@@ -147,23 +172,26 @@ _Full debate transcript: .opencode/architect-debates/1708123456789.md_
 
 ## Configuration
 
-All options are set under `architectPlugin` in `opencode.json`:
+All options go under `effectiveOpencode` (preferred) or `architectPlugin` in `opencode.json`:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `maxRounds` | `number` | `3` | Maximum debate rounds before stopping |
 | `retainSessions` | `boolean` | `false` | Keep sub-sessions after debate ends |
-| `timeoutMs` | `number` | `120000` | Per-prompt timeout in milliseconds |
+| `timeoutMs` | `number` | `300000` | Per-prompt timeout in milliseconds |
+| `proposerModel` | `string` | auto-detect | Model for Architect-1 |
+| `criticModel` | `string` | auto-detect | Model for Architect-2 |
 | `proposerPersona` | `string` | built-in | Custom system prompt for Architect-1 |
 | `criticPersona` | `string` | built-in | Custom system prompt for Architect-2 |
+| `improvementAudit` | object | — | Improvement-audit policy block |
 
 **Example — custom personas:**
 
 ```json
 {
-  "architectPlugin": {
+  "effectiveOpencode": {
     "maxRounds": 5,
-    "timeoutMs": 180000,
+    "timeoutMs": 300000,
     "proposerPersona": "You are a pragmatic backend engineer who values simplicity...",
     "criticPersona": "You are a strict API designer who enforces REST conventions..."
   }
@@ -173,93 +201,56 @@ All options are set under `architectPlugin` in `opencode.json`:
 ## File Structure
 
 ```
-opencode-architect-plugin/
-├── opencode.json          # Plugin registration and configuration
-├── package.json           # Dependencies (@opencode-ai/plugin)
-├── tsconfig.json          # TypeScript configuration
+effective-opencode/
+├── opencode.json              # Plugin registration and configuration
+├── package.json               # Dependencies
+├── tsconfig.json              # TypeScript configuration
+├── AGENTS.md                  # Guide for AI agents working on this repo
 └── src/
-    ├── index.ts           # Plugin entry point — registers the architect tool
-    ├── debate-engine.ts   # Core debate loop, session lifecycle, transcript saving
-    ├── prompts.ts         # Architect personas and prompt builders
-    ├── consensus.ts       # Verdict parsing and consensus detection
-    ├── context.ts         # Project context gathering via ctx.$
-    └── types.ts           # Shared TypeScript interfaces
+    ├── index.ts               # Plugin entry — hooks, tools, scope manager singleton
+    ├── debate-engine.ts       # Debate loop, session lifecycle, onSessionCreated contract
+    ├── prompts.ts             # Architect personas and prompt builders
+    ├── consensus.ts           # Verdict parsing and consensus detection
+    ├── context.ts             # Project context gathering
+    ├── types.ts               # Shared TypeScript interfaces and DEFAULT_CONFIG
+    ├── logger.ts              # Structured logger
+    ├── model-utils.ts         # Model selection utilities
+    ├── tmux-view.ts           # Optional live TUI via tmux split-pane
+    ├── improvement-audit/
+    │   ├── scope-manager.ts   # ArchitectRunScopeManager — run-scoped session tracking
+    │   ├── pipeline.ts        # Improvement-audit execution mode orchestration
+    │   ├── policy.ts          # Rule-based audit policy evaluation
+    │   └── analyze/           # Context, security, and perf analysis rules
+    ├── refactor/
+    │   ├── index.ts           # RefactorEngine orchestration
+    │   ├── scaffolder.ts      # File extraction and template generation
+    │   ├── differ.ts          # Diff preview and markdown formatting
+    │   ├── rollback.ts        # Checkpoint create/restore/list/delete
+    │   └── test-generator.ts  # Test template generation (vitest/jest/bun)
+    ├── security/
+    │   └── index.ts           # Command/content hash-based authorization cache
+    ├── skills/
+    │   └── index.ts           # Workspace skill loader (minimatch-based activation)
+    └── __tests__/             # All test files (bun:test)
 ```
 
-### Module Responsibilities
+## Local Development
 
-**`src/types.ts`**
-Core interfaces shared across modules:
-- `PluginConfig` — runtime configuration
-- `Verdict` — structured critic output (`approved`, `score`, `key_issues`)
-- `DialogueRound` — one round of proposal + critique + verdict
-- `ProtocolResult` — final output of a debate session
+```bash
+# Install dependencies
+bun install
 
-**`src/context.ts`**
-Gathers project context before the debate starts using Bun shell (`ctx.$`). Reads file tree, config files, and entry point source to give architects grounding in the actual codebase.
+# Build
+npm run build        # tsc → dist/
 
-**`src/consensus.ts`**
-Parses structured `json:verdict` fenced blocks from the Critic's responses. Falls back to keyword detection (`APPROVED: ...`) for resilience. Consensus requires `approved: true` AND `score >= 7`.
-
-**`src/prompts.ts`**
-Defines the default Proposer and Critic personas as inline constants (no external files). Exports prompt builder functions for each phase of the debate and formatters for both condensed output and full transcripts.
-
-**`src/debate-engine.ts`**
-The core protocol loop:
-- Creates two peer sub-sessions (`parentID` links them to the active session)
-- Drives the Propose → Critique → Revise loop
-- Handles 120s timeout per prompt with abort signal support
-- Cleans up sub-sessions in `try/finally` (unless `retainSessions: true`)
-- Saves the full transcript via `Bun.write()`
-
-**`src/index.ts`**
-Plugin entry point. Registers the `architect` tool using `tool()` from `@opencode-ai/plugin`. Reads `architectPlugin` overrides from `opencode.json` via the `config` hook.
-
-## Transcript Format
-
-Transcripts are saved to `.opencode/architect-debates/{timestamp}.md`:
-
-```markdown
-# Architect Debate Transcript
-
-**Vision**: Design a plugin system for a CLI tool
-**Rounds**: 2
-**Consensus**: Yes — Approved (score: 8/10)
-
----
-
-## Round 1
-
-### Proposer
-[Architect-1's initial proposal...]
-
-### Critic
-[Architect-2's critique...]
-
-**Verdict**: NOT APPROVED (6/10)
-**Issues**: Missing error boundaries; plugin isolation not addressed
-
----
-
-## Round 2
-
-### Proposer
-[Architect-1's revised proposal...]
-
-### Critic
-[Architect-2's final review...]
-
-**Verdict**: APPROVED (8/10)
-
----
+# Run tests (targeted — avoids dist/ duplication)
+npm test             # bun test ./src/__tests__/**/*.test.ts
 ```
+
+> Running bare `bun test` without a path glob picks up `dist/__tests__/` after a build, causing duplicate runs. Use `npm test` or target `src/__tests__/` explicitly.
 
 ## Requirements
 
 - [opencode](https://github.com/anomalyco/opencode) installed
 - [Bun](https://bun.sh) runtime
-- An AI model configured in opencode (Claude recommended)
-
-## Version
-
-**v1** — debate protocol only. The plugin facilitates the design phase; implementation proceeds naturally in the main session after consensus is returned.
+- An AI model configured in opencode
