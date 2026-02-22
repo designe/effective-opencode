@@ -1,0 +1,38 @@
+# Node + Bun outputs
+node_modules/
+dist/
+
+# Bun cache / package metadata
+.bun/
+bun.lockb
+
+# TypeScript build artifacts
+*.tsbuildinfo
+
+# Logs and temp files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+bun-debug.log*
+pnpm-debug.log*
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Opencode runtime data
+.opencode/
+
+# Test / coverage outputs
+coverage/
+tmp/
+temp/
