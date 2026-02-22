@@ -3,6 +3,8 @@ import {
   type PluginConfig,
   type PluginInput,
   type ProtocolResult,
+  type DebateVisibilityEvent,
+  type DebateAgent,
   type DialogueRound,
   type OpencodeClient,
   type ModelConfig,
@@ -33,6 +35,8 @@ export interface DebateInput {
   onRound: (round: DialogueRound) => void;
   /** Called when an architect starts or finishes a thinking step */
   onStatus?: (status: string) => void;
+  /** Preferred structured event stream for visibility updates */
+  onVisibility?: (event: DebateVisibilityEvent) => void | Promise<void>;
   /** URL of the running opencode server (for TUI connection) */
   serverUrl?: string;
   /**
@@ -550,38 +554,121 @@ export async function runDebate(
   input: DebateInput,
 ): Promise<ProtocolResult> {
   const { vision, projectContext, config, abort } = input;
-  const notify = (status: string) => {
-    log.info(status);
-    input.onStatus?.(status);
+  const emitToLegacyStatus = (status: string) => {
+    if (!input.onStatus) return;
+    try {
+      Promise.resolve(input.onStatus(status)).catch((err) => {
+        const error = err instanceof Error ? `${err.message} (${err.name})` : String(err);
+        log.warn("Status callback failed", {
+          error,
+        });
+      });
+    } catch (err) {
+      const error = err instanceof Error ? `${err.message} (${err.name})` : String(err);
+      log.warn("Status callback failed", {
+        error,
+      });
+    }
   };
-  const live = {
-    proposer: "idle",
-    critic: "idle",
-  };
-  let lastLiveStatus = "";
-  let lastLiveStatusAt = 0;
-  const emitLiveStatus = (force = false) => {
-    const next = `A1: ${live.proposer} | A2: ${live.critic}`;
-    const now = Date.now();
-    const tooSoon = now - lastLiveStatusAt < 8000;
-    if (!force && (next === lastLiveStatus || tooSoon)) {
+  const emitVisibility = (event: DebateVisibilityEvent, force = false) => {
+    const message = event.message.trim();
+    if (!message) return;
+    log.info(message);
+
+    if (input.onVisibility) {
+      try {
+        Promise.resolve(input.onVisibility(event)).catch((err) => {
+          const error = err instanceof Error ? `${err.message} (${err.name})` : String(err);
+          log.warn("Visibility callback failed", {
+            error,
+          });
+        });
+      } catch (err) {
+        const error = err instanceof Error ? `${err.message} (${err.name})` : String(err);
+        log.warn("Visibility callback failed", {
+          error,
+        });
+      }
       return;
     }
-    lastLiveStatus = next;
+
+    emitToLegacyStatus(message);
+
+    if (force && event.kind === "failure") {
+      log.debug("Force emitted failure event", {
+        message,
+      });
+    }
+  };
+  let terminalEmitted = false;
+  const emitTerminalVisibility = (event: DebateVisibilityEvent) => {
+    if (terminalEmitted) return;
+    terminalEmitted = true;
+    emitVisibility(event, true);
+  };
+  const notify = (status: string) => {
+    emitVisibility(
+      {
+        kind: "thinking",
+        message: status,
+        variant: "info",
+      },
+      true,
+    );
+  };
+  const getAgentLabel = (agent: "proposer" | "critic") =>
+    agent === "proposer" ? "Architect-1 (Proposer)" : "Architect-2 (Critic)";
+  const formatRound = (round = 0) =>
+    round > 0 ? `Round ${round}/${config.maxRounds}` : "Setup";
+
+  let activeRound = 0;
+  let lastLiveStatus = "";
+  let lastLiveStatusAt = 0;
+  const emitLiveStatus = (
+    status: string,
+    kind: DebateVisibilityEvent["kind"],
+    force = false,
+    agent?: DebateAgent,
+    round?: number,
+    variant: DebateVisibilityEvent["variant"] = "info",
+  ) => {
+    const now = Date.now();
+    const tooSoon = now - lastLiveStatusAt < 3000;
+    if (!force && (status === lastLiveStatus || tooSoon)) {
+      return;
+    }
+    lastLiveStatus = status;
     lastLiveStatusAt = now;
-    input.onStatus?.(next);
+    emitVisibility(
+      {
+        kind,
+        message: status,
+        agent,
+        round,
+        variant,
+      },
+      force,
+    );
   };
   const setLiveStatus = (
     agent: "proposer" | "critic",
     status: string,
     logAsInfo = false,
+    round?: number,
+    kind: DebateVisibilityEvent["kind"] = "thinking",
   ) => {
-    live[agent] = status;
+    const next = `${formatRound(round ?? activeRound)}: ${getAgentLabel(agent)} ${status}`;
     if (logAsInfo) {
-      const label = agent === "proposer" ? "Architect-1 (Proposer)" : "Architect-2 (Critic)";
-      log.info(`${label}: ${status}`);
+      log.info(next);
     }
-    emitLiveStatus(logAsInfo);
+    emitLiveStatus(
+      next,
+      kind,
+      logAsInfo,
+      agent,
+      round ?? activeRound,
+      logAsInfo ? "info" : "info",
+    );
   };
   const promptWithProgress = async (params: {
     agent: "proposer" | "critic";
@@ -591,9 +678,10 @@ export async function runDebate(
     model?: ModelConfig;
     leadModel?: string;
     phase: string;
+    round?: number;
   }): Promise<string> => {
     const started = Date.now();
-    setLiveStatus(params.agent, `${params.phase}...`, true);
+    setLiveStatus(params.agent, `${params.phase}...`, true, params.round);
     let tick = 0;
     const ticker = setInterval(() => {
       tick++;
@@ -601,7 +689,12 @@ export async function runDebate(
       if (tick % 3 === 0) {
         // Emit periodic "thinking" heartbeat so the lead session can surface
         // progress even while no new assistant message has completed yet.
-        setLiveStatus(params.agent, `${params.phase} (thinking ${elapsedSec}s)`);
+        setLiveStatus(
+          params.agent,
+          `${params.phase} in progress (thinking ${elapsedSec}s)`,
+          false,
+          params.round,
+        );
       }
       if (tick % 4 === 0) {
         log.debug("Agent still working", {
@@ -624,7 +717,12 @@ export async function runDebate(
         params.leadModel,
       );
       const elapsedSec = Math.floor((Date.now() - started) / 1000);
-      setLiveStatus(params.agent, `${params.phase} done (${elapsedSec}s)`, true);
+      setLiveStatus(
+        params.agent,
+        `completed ${params.phase} (${elapsedSec}s)`,
+        true,
+        params.round,
+      );
       return response;
     } finally {
       clearInterval(ticker);
@@ -668,6 +766,11 @@ export async function runDebate(
   let tmuxView: TmuxDebateView | null = null;
 
   try {
+    emitVisibility({
+      kind: "setup",
+      message: "Setup: creating architect sessions",
+      variant: "info",
+    }, true);
     // ── 1. Create peer sub-sessions in parallel (with pre-granted permissions) ──
     // Permission is embedded in the create body so tool calls from these sessions
     // never block waiting for a human to approve them.
@@ -692,11 +795,16 @@ export async function runDebate(
       proposer: sessions.proposer,
       critic: sessions.critic,
     });
+    emitVisibility({
+      kind: "setup",
+      message: "Setup: architect sessions ready",
+    });
 
     // ── 2. Launch tmux panes AND start initial proposal in parallel ─
     //    Also run critic preparation in parallel so Architect-2 does not idle.
     //    The TUI view is cosmetic — prompt execution doesn't depend on panes.
     log.debug("Launching tmux view, proposer draft, and critic prep in parallel");
+    activeRound = 1;
     const criticPreparationTask = promptWithProgress({
       agent: "critic",
       sessionID: sessions.critic,
@@ -704,6 +812,7 @@ export async function runDebate(
       timeoutMs: config.timeoutMs,
       model: criticModel,
       leadModel: config.leadModel,
+      round: 0,
       phase: "preparing review plan",
     }).catch((err) => {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -711,7 +820,7 @@ export async function runDebate(
         throw err;
       }
       log.warn("Critic preparation failed; continuing without prep context", { error: errMsg });
-      setLiveStatus("critic", "prep skipped (will critique proposal)", true);
+      setLiveStatus("critic", "prep skipped, will critique proposal", true, 0, "thinking");
       return "";
     });
 
@@ -731,20 +840,30 @@ export async function runDebate(
         timeoutMs: config.timeoutMs,
         model: proposerModel,
         leadModel: config.leadModel,
+        round: 1,
         phase: "drafting initial proposal",
       }),
       criticPreparationTask,
     ]);
-    setLiveStatus("critic", "waiting for proposal critique", true);
-    notify("Initial draft and prep completed");
+    setLiveStatus("proposer", "submitted initial proposal", true, 1, "thinking");
+    setLiveStatus("critic", "waiting to review initial proposal", true, 1, "thinking");
+    notify("Round 1 proposal draft and preparation completed");
 
     tmuxView = tmuxResult;
     if (tmuxView) {
+      emitVisibility({
+        kind: "setup",
+        message: "Setup: connected to live TMUX panes",
+      });
       log.info("Tmux debate view launched with opencode TUI instances", {
         proposerPane: tmuxView.proposer.paneId,
         criticPane: tmuxView.critic.paneId,
       });
     } else {
+      emitVisibility({
+        kind: "setup",
+        message: "Setup: tmux unavailable; using status stream only",
+      });
       log.warn(
         "Tmux debate view was NOT created — debate will proceed without live TUI panes. " +
         "Check the plugin log at ~/.local/share/opencode/effective-opencode.log for details.",
@@ -762,7 +881,9 @@ export async function runDebate(
     let proposal = initialProposal;
 
     for (let i = 0; i < config.maxRounds; i++) {
-      log.info(`Round ${i + 1}/${config.maxRounds}`);
+        log.info(`Round ${i + 1}/${config.maxRounds}`);
+        activeRound = i + 1;
+        setLiveStatus("critic", "starting review", true, i + 1);
 
       // Critic reviews
       let critiquePrompt =
@@ -784,7 +905,8 @@ export async function runDebate(
         timeoutMs: config.timeoutMs,
         model: criticModel,
         leadModel: config.leadModel,
-        phase: `critiquing round ${i + 1}/${config.maxRounds}`,
+        round: i + 1,
+        phase: `reviewing proposal for round ${i + 1}/${config.maxRounds}`,
       });
 
       const verdict = parseVerdict(critique);
@@ -803,6 +925,23 @@ export async function runDebate(
       };
       rounds.push(round);
       input.onRound(round);
+      const score = round.verdict?.score;
+      const approved = round.verdict?.approved;
+      const issueCount = round.verdict?.key_issues?.length ?? 0;
+      const status =
+        score === undefined
+          ? "critique parsed without verdict"
+          : `${approved ? "approved" : "needs revision"} (${score}/10, issues: ${issueCount})`;
+      const topIssue = round.verdict?.key_issues?.[0];
+      emitVisibility({
+        kind: "round_result",
+        round: i + 1,
+        agent: "critic",
+        message:
+          `Round ${i + 1}/${config.maxRounds}: Critic ${status}` +
+          (topIssue ? ` · top feedback: ${topIssue}` : ""),
+        variant: round.verdict?.approved ? "success" : "info",
+      });
 
       // Consensus check
       const consensus = detectConsensus(critique);
@@ -811,8 +950,14 @@ export async function runDebate(
           round: i + 1,
           summary: consensus.summary,
         });
-        setLiveStatus("proposer", "consensus reached", true);
-        setLiveStatus("critic", "consensus reached", true);
+        setLiveStatus("proposer", "confirmed consensus", true, i + 1, "consensus");
+        setLiveStatus("critic", "confirmed consensus", true, i + 1, "consensus");
+        emitTerminalVisibility({
+          kind: "consensus",
+          round: i + 1,
+          message: `Round ${i + 1}: Consensus reached!`,
+          variant: "success",
+        });
         notify(`Round ${i + 1}: Consensus reached!`);
         const transcriptPath = await saveTranscript(
           ctx,
@@ -832,7 +977,7 @@ export async function runDebate(
 
       // Proposer revises (skip on last round)
       if (i < config.maxRounds - 1) {
-        setLiveStatus("critic", "waiting for revised proposal", true);
+        setLiveStatus("critic", "waiting for revised proposal", true, i + 1);
         proposal = await promptWithProgress({
           agent: "proposer",
           sessionID: sessions.proposer,
@@ -840,7 +985,8 @@ export async function runDebate(
           timeoutMs: config.timeoutMs,
           model: proposerModel,
           leadModel: config.leadModel,
-          phase: `revising round ${i + 1}/${config.maxRounds}`,
+          round: i + 1,
+          phase: `revising proposal for round ${i + 1}/${config.maxRounds}`,
         });
       }
     }
@@ -850,8 +996,14 @@ export async function runDebate(
     });
 
     const summary = "Max rounds reached without full consensus";
-    setLiveStatus("proposer", "max rounds reached", true);
-    setLiveStatus("critic", "max rounds reached", true);
+    setLiveStatus("proposer", "completed max rounds without consensus", true, activeRound, "complete");
+    setLiveStatus("critic", "completed max rounds without consensus", true, activeRound, "complete");
+    emitTerminalVisibility({
+      kind: "complete",
+      round: activeRound,
+      message: "Max rounds reached without full consensus",
+      variant: "warning",
+    });
     const transcriptPath = await saveTranscript(
       ctx,
       vision,
@@ -873,6 +1025,13 @@ export async function runDebate(
     const errMsg = err instanceof Error ? err.message : String(err);
     const errName = err instanceof Error ? err.constructor.name : typeof err;
     const errStack = err instanceof Error ? err.stack : undefined;
+    const cancelled = errMsg.includes("Debate cancelled by user");
+    emitTerminalVisibility({
+      kind: cancelled ? "cancelled" : "failure",
+      round: activeRound,
+      message: cancelled ? "Debate cancelled by user" : `Debate failed: ${errMsg}`,
+      variant: cancelled ? "warning" : "error",
+    });
     log.error("runDebate failed", {
       errorType: errName,
       error: errMsg,
@@ -889,8 +1048,8 @@ export async function runDebate(
     input.architectSessions?.delete(sessions.critic);
 
     if (tmuxView) {
-      setLiveStatus("proposer", "cleaning up", true);
-      setLiveStatus("critic", "cleaning up", true);
+      setLiveStatus("proposer", "cleaning up", true, activeRound);
+      setLiveStatus("critic", "cleaning up", true, activeRound);
       await tmuxView.cleanup();
     }
 

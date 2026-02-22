@@ -103,6 +103,25 @@ export interface DialogueRound {
   verdict: Verdict | null;
 }
 
+export type DebateAgent = "proposer" | "critic";
+
+export type DebateVisibilityKind =
+  | "setup"
+  | "thinking"
+  | "round_result"
+  | "consensus"
+  | "failure"
+  | "cancelled"
+  | "complete";
+
+export interface DebateVisibilityEvent {
+  kind: DebateVisibilityKind;
+  round?: number;
+  agent?: DebateAgent;
+  message: string;
+  variant?: "info" | "success" | "warning" | "error";
+}
+
 export interface ProtocolResult {
   rounds: DialogueRound[];
   finalDesign: string;

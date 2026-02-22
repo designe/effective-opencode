@@ -1,9 +1,14 @@
 {
   "name": "effective-opencode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pair programming plugin for opencode — two AI architects debate designs to consensus",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "!dist/__tests__/**",
+    "!dist/**/__tests__/**"
+  ],
   "exports": {
     ".": {
       "import": "./dist/index.js",
@@ -13,7 +18,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "bun test src/__tests__"
+    "test": "bun test ./src/__tests__/**/*.test.ts ./src/__tests__/*test.ts",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@opencode-ai/plugin": "latest",

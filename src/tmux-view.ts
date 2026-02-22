@@ -142,6 +142,9 @@ export async function createTmuxDebateView(
       critic: { paneId: criticPaneId, cmd: criticCmd },
     });
 
+    await $`tmux select-pane -T "Architect-1 (Proposer)" -t ${proposerPaneId}`.catch(() => {});
+    await $`tmux select-pane -T "Architect-2 (Critic)" -t ${criticPaneId}`.catch(() => {});
+
     await $`tmux send-keys -t ${proposerPaneId} ${proposerCmd} Enter`;
     await $`tmux send-keys -t ${criticPaneId} ${criticCmd} Enter`;
 

@@ -364,20 +364,35 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
           let lastToastMessage = "";
           let lastToastAt = 0;
           let toastEnabled = true;
+          const emitArchitectVisibility = (
+            event: {
+              kind: string;
+              message: string;
+              variant?: "info" | "success" | "warning" | "error";
+            },
+          ) => {
+            emitArchitectStatus(event.message, {
+              forceToast: event.kind !== "setup" && event.kind !== "thinking",
+              variant: event.variant ?? "info",
+            });
+          };
           const emitArchitectStatus = (
             title: string,
-            options?: { forceToast?: boolean; variant?: "info" | "success" | "warning" | "error" },
+            options?: {
+              forceToast?: boolean;
+              variant?: "info" | "success" | "warning" | "error";
+            },
           ) => {
             setMetaTitle(title);
 
             if (!toastEnabled) return;
             if (toolCtx.abort.aborted) return;
 
-            const message = title.replace(/^Architects:\s*/, "").trim();
+            const message = title.trim();
             if (!message) return;
 
             const now = Date.now();
-            const tooSoon = now - lastToastAt < 5000;
+            const tooSoon = now - lastToastAt < 2500;
             if (!options?.forceToast && (message === lastToastMessage || tooSoon)) {
               return;
             }
@@ -418,19 +433,19 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
                 audit = buildSyntheticAuditFailureOutcome(ctx.directory, error);
               }
 
-               if (policy.fallbackMode === "returnPartial" && audit.status !== "healthy") {
-                 const partial = `## Improvement Audit
+              if (policy.fallbackMode === "returnPartial" && audit.status !== "healthy") {
+                const partial = `## Improvement Audit
 
 Status: ${audit.status}
 ${audit.summary}`;
-                 const includeAuditOutput =
-                   typeof parsedArgs.value.includeAuditOutput === "boolean"
-                     ? parsedArgs.value.includeAuditOutput
-                     : policy.includeAuditOutputDefault;
-                 return includeAuditOutput
-                   ? appendAuditSummary(partial, audit)
-                   : partial + "\n\nDebate was skipped due to returnPartial audit mode.";
-               }
+                const includeAuditOutput =
+                  typeof parsedArgs.value.includeAuditOutput === "boolean"
+                    ? parsedArgs.value.includeAuditOutput
+                    : policy.includeAuditOutputDefault;
+                return includeAuditOutput
+                  ? appendAuditSummary(partial, audit)
+                  : partial + "\n\nDebate was skipped due to returnPartial audit mode.";
+              }
 
               const projectContext = await gatherProjectContext(ctx);
               const vision = buildAuditVision(parsedArgs.value.vision, audit);
@@ -443,19 +458,14 @@ ${audit.summary}`;
                 serverUrl: ctx.serverUrl?.toString(),
                 architectSessions,
                 onRound: (round) => {
-                  emitArchitectStatus(
-                    `Architects: Round ${round.round}/${config.maxRounds} ${
-                      round.verdict?.approved ? "(consensus!)" : ""
-                    }`,
-                    {
-                      forceToast: true,
-                      variant: round.verdict?.approved ? "success" : "info",
-                    },
-                  );
+                  log.debug("Debate round completed", {
+                    round: round.round,
+                    approved: round.verdict?.approved,
+                    score: round.verdict?.score,
+                  });
                 },
-                onStatus: (status) => {
-                  emitArchitectStatus(`Architects: ${status}`);
-                },
+                onVisibility: emitArchitectVisibility,
+                onStatus: emitArchitectStatus,
               });
 
               const baseline = formatCondensedResult(
@@ -492,21 +502,16 @@ ${audit.summary}`;
               abort: toolCtx.abort,
               serverUrl: ctx.serverUrl?.toString(),
               architectSessions,
-              onRound: (round) => {
-                emitArchitectStatus(
-                  `Architects: Round ${round.round}/${config.maxRounds} ${
-                    round.verdict?.approved ? "(consensus!)" : ""
-                  }`,
-                  {
-                    forceToast: true,
-                    variant: round.verdict?.approved ? "success" : "info",
-                  },
-                );
-              },
-              onStatus: (status) => {
-                emitArchitectStatus(`Architects: ${status}`);
-              },
-            });
+                onRound: (round) => {
+                  log.debug("Debate round completed", {
+                    round: round.round,
+                    approved: round.verdict?.approved,
+                    score: round.verdict?.score,
+                  });
+                },
+                onVisibility: emitArchitectVisibility,
+                onStatus: emitArchitectStatus,
+              });
 
             return formatCondensedResult(
               result.finalDesign,
