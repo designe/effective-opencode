@@ -15,7 +15,7 @@ export interface TmuxPane {
  * Manages the tmux split-pane layout with live opencode TUI instances
  * for the proposer and critic architects.
  *
- * Each pane runs a real `opencode --session=<id> --model=<model>` process,
+ * Each pane runs a real `opencode` process attached to a specific session,
  * so the user sees the actual opencode interface — not a log tail.
  */
 export interface TmuxDebateView {
@@ -34,12 +34,19 @@ export interface TmuxDebateViewOptions {
 }
 
 /**
+ * Quote a value for safe shell execution in `tmux send-keys`.
+ */
+function shellQuote(value: string): string {
+  if (value === "") return "''";
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
  * Build the opencode CLI command for a tmux pane.
  *
- * Uses `--session` to attach to an existing session so the TUI
- * displays the conversation in real time as the SDK prompts it.
- * Passes the server URL via OPENCODE_URL env var so the TUI
- * connects to the existing server instead of starting a new one.
+ * When a server URL is available, use `opencode attach <url>` so the pane
+ * connects to the exact running server used by the SDK debate flow.
+ * If server URL is unavailable, fall back to local `opencode --session`.
  */
 function buildOpencodeCommand(opts: {
   sessionId: string;
@@ -47,15 +54,21 @@ function buildOpencodeCommand(opts: {
   serverUrl?: string;
 }): string {
   const parts: string[] = [];
-  // Ensure the TUI instance connects to the running server
+
   if (opts.serverUrl) {
-    parts.push(`OPENCODE_URL=${opts.serverUrl}`);
+    parts.push("opencode");
+    parts.push("attach");
+    parts.push(shellQuote(opts.serverUrl));
+    parts.push(`--session=${shellQuote(opts.sessionId)}`);
+    return parts.join(" ");
   }
+
   parts.push("opencode");
-  parts.push(`--session=${opts.sessionId}`);
+  parts.push(`--session=${shellQuote(opts.sessionId)}`);
   if (opts.model) {
-    parts.push(`--model=${opts.model}`);
+    parts.push(`--model=${shellQuote(opts.model)}`);
   }
+
   return parts.join(" ");
 }
 
@@ -142,8 +155,22 @@ export async function createTmuxDebateView(
       critic: { paneId: criticPaneId, cmd: criticCmd },
     });
 
-    await $`tmux select-pane -T "Architect-1 (Proposer)" -t ${proposerPaneId}`.catch(() => {});
-    await $`tmux select-pane -T "Architect-2 (Critic)" -t ${criticPaneId}`.catch(() => {});
+    try {
+      await $`tmux select-pane -T "Architect-1 (Proposer)" -t ${proposerPaneId}`;
+    } catch (e) {
+      log.debug("Failed to set proposer pane title (non-fatal)", {
+        paneId: proposerPaneId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    try {
+      await $`tmux select-pane -T "Architect-2 (Critic)" -t ${criticPaneId}`;
+    } catch (e) {
+      log.debug("Failed to set critic pane title (non-fatal)", {
+        paneId: criticPaneId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
 
     await $`tmux send-keys -t ${proposerPaneId} ${proposerCmd} Enter`;
     await $`tmux send-keys -t ${criticPaneId} ${criticCmd} Enter`;
@@ -161,15 +188,43 @@ export async function createTmuxDebateView(
         try {
           log.debug("Cleaning up tmux panes");
           if (proposerPaneId) {
-            await $`tmux send-keys -t ${proposerPaneId} C-c`.catch(() => {});
+            try {
+              await $`tmux send-keys -t ${proposerPaneId} C-c`;
+            } catch (e) {
+              log.debug("Failed to send C-c to proposer pane (non-fatal)", {
+                paneId: proposerPaneId,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
             // Give opencode a moment to exit gracefully
             await new Promise((r) => setTimeout(r, 500));
-            await $`tmux kill-pane -t ${proposerPaneId}`.catch(() => {});
+            try {
+              await $`tmux kill-pane -t ${proposerPaneId}`;
+            } catch (e) {
+              log.debug("Failed to kill proposer pane (non-fatal)", {
+                paneId: proposerPaneId,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
           }
           if (criticPaneId) {
-            await $`tmux send-keys -t ${criticPaneId} C-c`.catch(() => {});
+            try {
+              await $`tmux send-keys -t ${criticPaneId} C-c`;
+            } catch (e) {
+              log.debug("Failed to send C-c to critic pane (non-fatal)", {
+                paneId: criticPaneId,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
             await new Promise((r) => setTimeout(r, 500));
-            await $`tmux kill-pane -t ${criticPaneId}`.catch(() => {});
+            try {
+              await $`tmux kill-pane -t ${criticPaneId}`;
+            } catch (e) {
+              log.debug("Failed to kill critic pane (non-fatal)", {
+                paneId: criticPaneId,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
           }
         } catch (e) {
           log.warn("Error during tmux cleanup (non-fatal)", e);
