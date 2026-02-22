@@ -495,8 +495,10 @@ async function promptSession(
  * so tool calls from these sessions never block waiting for human approval.
  */
 const ARCHITECT_PERMISSIONS = [
+  { permission: "read", pattern: "*", action: "allow" },
   { permission: "bash", pattern: "*", action: "allow" },
   { permission: "edit", pattern: "*", action: "allow" },
+  { permission: "write", pattern: "*", action: "allow" },
   { permission: "glob", pattern: "*", action: "allow" },
   { permission: "grep", pattern: "*", action: "allow" },
   { permission: "webfetch", pattern: "*", action: "allow" },

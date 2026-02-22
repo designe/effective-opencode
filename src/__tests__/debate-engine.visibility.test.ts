@@ -13,6 +13,12 @@ type MockShell = {
   };
 };
 
+type SessionCreateBody = {
+  parentID?: string;
+  title?: string;
+  permission?: Array<{ permission?: unknown }>;
+};
+
 type MockSessionState = {
   role: "proposer" | "critic";
   calls: number;
@@ -53,6 +59,7 @@ const mkShell = (): MockShell => {
 const createMockDebateClient = (responses: {
   proposer: string[];
   critic: string[];
+  onCreate?: (body: SessionCreateBody) => void;
 }): OpencodeClient => {
   const sessions = new Map<string, MockSessionState>();
   let nextSessionId = 0;
@@ -91,6 +98,7 @@ const createMockDebateClient = (responses: {
       create: async ({ body }: { body?: { title?: string } }) => {
         const id = `session-${++nextSessionId}`;
         const title = body?.title ?? "";
+        responses.onCreate?.(body as SessionCreateBody);
         const role = title.includes("Architect-1") ? "proposer" : "critic";
         sessions.set(id, { role, calls: 0, messages: [] });
         return { data: { id } };
@@ -175,6 +183,41 @@ describe("debate-engine visibility callbacks", () => {
     maxRounds: 1,
     retainSessions: false,
     timeoutMs: 300_000,
+  };
+
+  const assertCreatePermissions = async (toolCtx: {
+    title: string;
+    verdict: string;
+    proposal: string;
+  }) => {
+    const calls: SessionCreateBody[] = [];
+    const client = createMockDebateClient({
+      proposer: [toolCtx.proposal],
+      critic: ["Prep notes", toolCtx.verdict],
+      onCreate: (body) => {
+        calls.push(body);
+      },
+    });
+
+    const directory = await mkWorkingDir();
+    tempDirs.push(directory);
+
+    const result = await runDebate(client, {
+      directory,
+      $: mkShell() as unknown as never,
+    }, {
+      parentSessionID: "parent",
+      vision: toolCtx.title,
+      projectContext: "Project context",
+      config,
+      abort: new AbortController().signal,
+      architectSessions: new Set(),
+      onRound: () => {},
+    });
+
+    expect(result.consensus).toBe(true);
+    expect(calls).toHaveLength(2);
+    return calls;
   };
 
   const verdict = "```json:verdict\n{" +
@@ -367,5 +410,23 @@ describe("debate-engine visibility callbacks", () => {
 
     expect(result.consensus).toBe(true);
     expect(callbackCount).toBeGreaterThan(0);
+  });
+
+  test("creates sub-sessions with read/edit/write permissions", async () => {
+    const calls = await assertCreatePermissions({
+      title: "Enable subagent file editing",
+      verdict,
+      proposal: "Initial proposal draft",
+    });
+
+    for (const call of calls) {
+      const perms = call.permission ?? [];
+      const enabled = perms
+        .map((entry) => typeof entry.permission === "string" ? entry.permission : "")
+        .filter(Boolean);
+      expect(enabled).toContain("read");
+      expect(enabled).toContain("edit");
+      expect(enabled).toContain("write");
+    }
   });
 });

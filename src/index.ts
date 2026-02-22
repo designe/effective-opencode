@@ -158,7 +158,9 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
           name: "architect",
           mode: "subagent",
           permission: {
+            read: "allow",
             edit: "allow",
+            write: "allow",
             bash: "allow",
             webfetch: "allow",
             doom_loop: "allow",
