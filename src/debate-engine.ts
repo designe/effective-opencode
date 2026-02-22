@@ -598,6 +598,11 @@ export async function runDebate(
     const ticker = setInterval(() => {
       tick++;
       const elapsedSec = Math.floor((Date.now() - started) / 1000);
+      if (tick % 3 === 0) {
+        // Emit periodic "thinking" heartbeat so the lead session can surface
+        // progress even while no new assistant message has completed yet.
+        setLiveStatus(params.agent, `${params.phase} (thinking ${elapsedSec}s)`);
+      }
       if (tick % 4 === 0) {
         log.debug("Agent still working", {
           agent: params.agent,

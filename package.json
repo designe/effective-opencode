@@ -12,7 +12,8 @@
   },
   "type": "module",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "bun test src/__tests__"
   },
   "dependencies": {
     "@opencode-ai/plugin": "latest",

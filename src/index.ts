@@ -10,7 +10,8 @@ import type {
 } from "./types";
 import { DEFAULT_CONFIG } from "./types";
 import { runDebate } from "./debate-engine";
-import { gatherProjectContext } from "./context";
+import { gatherProjectContext, invalidateContextCache } from "./context";
+import { shouldInvalidateContextCacheFromToolEvent } from "./context/mutation-policy";
 import { formatCondensedResult } from "./prompts";
 import { createContextLogger } from "./logger";
 import { resolveLeadModel } from "./model-utils";
@@ -35,6 +36,7 @@ import { ArchitectRunScopeManager } from "./improvement-audit/scope-manager";
 
 // Security & Skills Engine
 import { AuthorizationEngine } from "./security/index";
+import { parseBashCommand } from "./security/command-parser";
 import { ContextAwareSkillLoader } from "./skills/index";
 
 // Refactoring Engine
@@ -229,6 +231,15 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
         ) {
           recentContext.add(args.filePath);
         }
+
+        const cacheDecision = shouldInvalidateContextCacheFromToolEvent(event);
+        if (cacheDecision.mutate) {
+          invalidateContextCache(ctx.directory);
+          log.debug("Invalidated project context cache", {
+            tool: toolName,
+            reason: cacheDecision.reason,
+          });
+        }
       }
     },
 
@@ -278,15 +289,16 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       const { tool: toolName } = input;
       const args = input.args ?? output.args;
       if (toolName === "bash" && args && typeof args.command === "string") {
-        const cmdParts = args.command.split(" ");
-        if (cmdParts.length > 0) {
-          await authEngine.verifyAndAuthorize(
-            "bash_execution",
-            cmdParts[0],
-            cmdParts.slice(1),
-            ctx.directory,
-          );
-        }
+        const parsed = parseBashCommand(args.command);
+        const command = parsed?.command ?? args.command.trim();
+        const commandArgs = parsed?.args ?? [];
+
+        await authEngine.verifyAndAuthorize(
+          "bash_execution",
+          command,
+          commandArgs,
+          ctx.directory,
+        );
       }
     },
 
@@ -349,6 +361,47 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
             lastMetaTitle = title;
             toolCtx.metadata({ title });
           };
+          let lastToastMessage = "";
+          let lastToastAt = 0;
+          let toastEnabled = true;
+          const emitArchitectStatus = (
+            title: string,
+            options?: { forceToast?: boolean; variant?: "info" | "success" | "warning" | "error" },
+          ) => {
+            setMetaTitle(title);
+
+            if (!toastEnabled) return;
+            if (toolCtx.abort.aborted) return;
+
+            const message = title.replace(/^Architects:\s*/, "").trim();
+            if (!message) return;
+
+            const now = Date.now();
+            const tooSoon = now - lastToastAt < 5000;
+            if (!options?.forceToast && (message === lastToastMessage || tooSoon)) {
+              return;
+            }
+
+            lastToastMessage = message;
+            lastToastAt = now;
+
+            ctx.client.tui
+              .showToast({
+                body: {
+                  title: "Architects",
+                  message,
+                  variant: options?.variant ?? "info",
+                  duration: 2200,
+                },
+              })
+              .catch((error: unknown) => {
+                toastEnabled = false;
+                log.debug("TUI toast unavailable; falling back to metadata title only", {
+                  sessionID: toolCtx.sessionID,
+                  error,
+                });
+              });
+          };
 
           try {
             const policy = resolveAuditPolicy(parsedArgs.value);
@@ -390,14 +443,18 @@ ${audit.summary}`;
                 serverUrl: ctx.serverUrl?.toString(),
                 architectSessions,
                 onRound: (round) => {
-                  setMetaTitle(
+                  emitArchitectStatus(
                     `Architects: Round ${round.round}/${config.maxRounds} ${
                       round.verdict?.approved ? "(consensus!)" : ""
                     }`,
+                    {
+                      forceToast: true,
+                      variant: round.verdict?.approved ? "success" : "info",
+                    },
                   );
                 },
                 onStatus: (status) => {
-                  setMetaTitle(`Architects: ${status}`);
+                  emitArchitectStatus(`Architects: ${status}`);
                 },
               });
 
@@ -436,14 +493,18 @@ ${audit.summary}`;
               serverUrl: ctx.serverUrl?.toString(),
               architectSessions,
               onRound: (round) => {
-                setMetaTitle(
+                emitArchitectStatus(
                   `Architects: Round ${round.round}/${config.maxRounds} ${
                     round.verdict?.approved ? "(consensus!)" : ""
                   }`,
+                  {
+                    forceToast: true,
+                    variant: round.verdict?.approved ? "success" : "info",
+                  },
                 );
               },
               onStatus: (status) => {
-                setMetaTitle(`Architects: ${status}`);
+                emitArchitectStatus(`Architects: ${status}`);
               },
             });
 

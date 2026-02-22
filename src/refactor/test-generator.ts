@@ -6,6 +6,7 @@
  */
 
 import * as path from 'path';
+import { readFileSync } from 'fs';
 import { createContextLogger } from '../logger';
 
 const log = createContextLogger('test-generator');
@@ -25,7 +26,10 @@ export function detectTestFramework(workspaceRoot: string): TestFramework {
   const packageJsonPath = path.join(workspaceRoot, 'package.json');
   
   try {
-    const packageJson = require(packageJsonPath);
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as {
+      dependencies?: Record<string, unknown>;
+      devDependencies?: Record<string, unknown>;
+    };
     
     if (packageJson.devDependencies?.vitest || packageJson.dependencies?.vitest) {
       return 'vitest';
@@ -112,9 +116,12 @@ function generateJestTest(
 ): string {
   const fileName = path.basename(filePath, '.ts');
   const importPath = `./${path.basename(filePath, '.ts')}`;
-  
+  const runtimeExports = [...exports.classes, ...exports.functions];
+   
   const lines: string[] = [];
-  lines.push(`import { ${[...exports.classes, ...exports.functions].join(', ')} } from '${importPath}';`);
+  if (runtimeExports.length > 0) {
+    lines.push(`import { ${runtimeExports.join(', ')} } from '${importPath}';`);
+  }
   lines.push('');
   
   // Add describe blocks for classes
@@ -169,10 +176,13 @@ function generateVitestTest(
 ): string {
   const fileName = path.basename(filePath, '.ts');
   const importPath = `./${path.basename(filePath, '.ts')}`;
-  
+  const runtimeExports = [...exports.classes, ...exports.functions];
+   
   const lines: string[] = [];
   lines.push(`import { describe, it, expect } from 'vitest';`);
-  lines.push(`import { ${[...exports.classes, ...exports.functions].join(', ')} } from '${importPath}';`);
+  if (runtimeExports.length > 0) {
+    lines.push(`import { ${runtimeExports.join(', ')} } from '${importPath}';`);
+  }
   lines.push('');
   
   // Add describe blocks for classes
@@ -227,10 +237,13 @@ function generateBunTest(
 ): string {
   const fileName = path.basename(filePath, '.ts');
   const importPath = `./${path.basename(filePath, '.ts')}`;
-  
+  const runtimeExports = [...exports.classes, ...exports.functions];
+   
   const lines: string[] = [];
   lines.push(`import { describe, expect, test } from 'bun:test';`);
-  lines.push(`import { ${[...exports.classes, ...exports.functions].join(', ')} } from '${importPath}';`);
+  if (runtimeExports.length > 0) {
+    lines.push(`import { ${runtimeExports.join(', ')} } from '${importPath}';`);
+  }
   lines.push('');
   
   // Add describe blocks for classes

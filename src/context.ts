@@ -2,8 +2,37 @@ import * as path from "path";
 import { readFile } from "node:fs/promises";
 import type { PluginInput } from "./types";
 import { createContextLogger } from "./logger";
+import {
+  ContextCache,
+  type ContextCacheRequest,
+} from "./context/cache";
 
 const log = createContextLogger("context");
+
+const contextCache = new ContextCache({
+  ttlMs: 30_000,
+  maxEntries: 24,
+});
+
+const CONTEXT_SCAN_DEPTH = 8;
+const CONTEXT_TREE_LIMIT = 100;
+const CONFIG_PREVIEW_LIMIT = 2000;
+const ENTRY_POINT_PREVIEW_LINES = 200;
+
+const CONFIG_FILES = [
+  "package.json",
+  "tsconfig.json",
+  "opencode.json",
+  "README.md",
+] as const;
+
+const ENTRY_POINTS = [
+  "src/index.ts",
+  "src/main.ts",
+  "src/app.ts",
+  "index.ts",
+  "main.ts",
+] as const;
 
 type ContextInput = Pick<PluginInput, "$" | "directory">;
 
@@ -34,30 +63,50 @@ export async function gatherProjectContext(
 ): Promise<string> {
   const worktree = path.resolve(ctx.directory);
 
-  const configFiles = [
-    "package.json",
-    "tsconfig.json",
-    "opencode.json",
-    "README.md",
-  ] as const;
+  const cacheRequest: ContextCacheRequest = {
+    root: worktree,
+    key: JSON.stringify({
+      configFiles: CONFIG_FILES,
+      entryPoints: ENTRY_POINTS,
+      depth: CONTEXT_SCAN_DEPTH,
+      treeLimit: CONTEXT_TREE_LIMIT,
+    }),
+  };
 
-  const entryPoints = [
-    "src/index.ts",
-    "src/main.ts",
-    "src/app.ts",
-    "index.ts",
-    "main.ts",
-  ] as const;
+  return contextCache.getOrLoad(cacheRequest, () => generateProjectContext(ctx, worktree));
+}
+
+export function invalidateContextCache(workspaceRoot: string): void {
+  const normalized = path.resolve(workspaceRoot);
+  contextCache.invalidateRoot(normalized);
+}
+
+async function generateProjectContext(
+  ctx: ContextInput,
+  worktree: string,
+): Promise<string> {
 
   // Run all I/O in parallel: file tree + config files + entry points
-  const [treeResult, configResults, entryResults] = await Promise.allSettled([
-    // File tree: scoped strictly to worktree, max depth 8 to avoid deep traversal
-    ctx
-      .$`find ${worktree} -maxdepth 8 -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/.cache/*" | sort | head -100`
-      .text(),
-    Promise.all(configFiles.map((file) => readFileIfExists(path.join(worktree, file)))),
-    Promise.all(entryPoints.map((entry) => readFileIfExists(path.join(worktree, entry)))),
-  ]);
+  const fileTree = ctx
+    .$`find ${worktree} -maxdepth ${CONTEXT_SCAN_DEPTH} -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/.cache/*" | sort | head -${CONTEXT_TREE_LIMIT}`
+    .text();
+  const configFileReads = Promise.all(
+    CONFIG_FILES.map((file) => readFileIfExists(path.join(worktree, file))),
+  );
+  const entryPointReads = Promise.all(
+    ENTRY_POINTS.map((entry) => readFileIfExists(path.join(worktree, entry))),
+  );
+
+  const contextJobs: [
+    Promise<string>,
+    Promise<(string | null)[]>,
+    Promise<(string | null)[]>,
+  ] = [fileTree, configFileReads, entryPointReads];
+
+  const results = await Promise.allSettled(contextJobs);
+  const treeResult = results[0];
+  const configResults = results[1];
+  const entryResults = results[2];
 
   const sections: string[] = [];
 
@@ -74,13 +123,13 @@ export async function gatherProjectContext(
   const configTexts = configResults.status === "fulfilled" ? configResults.value : [];
 
   // Process config files
-  for (let i = 0; i < configFiles.length; i++) {
+  for (let i = 0; i < CONFIG_FILES.length; i++) {
     const content = configTexts[i];
-    const file = configFiles[i];
+    const file = CONFIG_FILES[i];
     if (typeof content === "string" && content.trim()) {
       const ext = file.endsWith(".md") ? "markdown" : "json";
       sections.push(
-        `## ${file}\n\`\`\`${ext}\n${content.slice(0, 2000)}\n\`\`\``,
+        `## ${file}\n\`\`\`${ext}\n${content.slice(0, CONFIG_PREVIEW_LIMIT)}\n\`\`\``,
       );
       log.debug(`Gathered config file: ${file}`);
     } else {
@@ -92,13 +141,13 @@ export async function gatherProjectContext(
 
   // Process entry points, stop after 3 hits
   let entryCount = 0;
-  for (let i = 0; i < entryPoints.length; i++) {
+  for (let i = 0; i < ENTRY_POINTS.length; i++) {
     if (entryCount >= 3) break;
     const content = entryTexts[i];
-    const entry = entryPoints[i];
+    const entry = ENTRY_POINTS[i];
     if (typeof content === "string" && content.trim()) {
       sections.push(
-        `## ${entry}\n\`\`\`typescript\n${headLines(content, 200)}\n\`\`\``,
+        `## ${entry}\n\`\`\`typescript\n${headLines(content, ENTRY_POINT_PREVIEW_LINES)}\n\`\`\``,
       );
       entryCount++;
       log.debug(`Gathered entry point: ${entry}`);
