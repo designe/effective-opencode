@@ -45,7 +45,16 @@ export interface DebateInput {
    * from architect sessions (so they don't hang waiting for human approval).
    */
   architectSessions?: Set<string>;
+
+  onSessionCreated?: (
+    sessionID: string,
+    agent: "proposer" | "critic",
+  ) => Promise<AttachResult> | AttachResult;
 }
+
+export type AttachResult =
+  | { ok: true }
+  | { ok: false; reason: "run-not-found" | "run-ended" | "duplicate-session" };
 
 type PromptPart = { type?: string; text?: string };
 type PromptResponsePayload = {
@@ -765,7 +774,27 @@ export async function runDebate(
   });
 
   const sessions = { proposer: "", critic: "" };
+  const createdSessions: string[] = [];
   let tmuxView: TmuxDebateView | null = null;
+
+  const attachSession = async (
+    agent: "proposer" | "critic",
+    createFn: () => Promise<string>,
+  ) => {
+    const sessionID = await createFn();
+    createdSessions.push(sessionID);
+
+    const callbackResult: AttachResult = input.onSessionCreated
+      ? await Promise.resolve(input.onSessionCreated(sessionID, agent))
+      : { ok: true };
+
+    if (!callbackResult.ok) {
+      throw new Error(`Failed to bind ${agent} session ${sessionID}: ${callbackResult.reason}`);
+    }
+
+    input.architectSessions?.add(sessionID);
+    return sessionID;
+  };
 
   try {
     emitVisibility({
@@ -777,25 +806,25 @@ export async function runDebate(
     // Permission is embedded in the create body so tool calls from these sessions
     // never block waiting for a human to approve them.
     log.debug("Creating proposer and critic sessions in parallel (with pre-granted permissions)");
-    const [proposerID, criticID] = await Promise.all([
-      createArchitectSession(client, {
-        parentID: input.parentSessionID,
-        title: `Architect-1 (Proposer): ${vision.slice(0, 50)}`,
-      }),
-      createArchitectSession(client, {
-        parentID: input.parentSessionID,
-        title: `Architect-2 (Critic): ${vision.slice(0, 50)}`,
-      }),
-    ]);
-    sessions.proposer = proposerID;
-    sessions.critic = criticID;
-    // Also register in the shared set as a belt-and-suspenders safety net
-    // in case the permission.ask hook fires for any edge-case requests.
-    input.architectSessions?.add(sessions.proposer);
-    input.architectSessions?.add(sessions.critic);
-    log.debug("Both sessions created with permissions", {
-      proposer: sessions.proposer,
-      critic: sessions.critic,
+      const [proposerID, criticID] = await Promise.all([
+        attachSession("proposer", () =>
+          createArchitectSession(client, {
+            parentID: input.parentSessionID,
+            title: `Architect-1 (Proposer): ${vision.slice(0, 50)}`,
+          }),
+        ),
+        attachSession("critic", () =>
+          createArchitectSession(client, {
+            parentID: input.parentSessionID,
+            title: `Architect-2 (Critic): ${vision.slice(0, 50)}`,
+          }),
+        ),
+      ]);
+      sessions.proposer = proposerID;
+      sessions.critic = criticID;
+      log.debug("Both sessions created with permissions", {
+        proposer: sessions.proposer,
+        critic: sessions.critic,
     });
     emitVisibility({
       kind: "setup",
@@ -1046,8 +1075,9 @@ export async function runDebate(
     // ── 4. Cleanup ───────────────────────────────────────────────
     // Deregister from the permission auto-approve set first, so no further
     // tool calls are approved for these sessions after cleanup starts.
-    input.architectSessions?.delete(sessions.proposer);
-    input.architectSessions?.delete(sessions.critic);
+    for (const sessionID of createdSessions) {
+      input.architectSessions?.delete(sessionID);
+    }
 
     if (tmuxView) {
       setLiveStatus("proposer", "cleaning up", true, activeRound);

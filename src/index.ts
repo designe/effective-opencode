@@ -69,7 +69,8 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
 
   // 3. Track active architect run scopes for recursion safety and permissions.
   const scopeManager = new ArchitectRunScopeManager();
-  const architectSessions = new Set<string>();
+  const isAutoApprovableSession = (sessionID: string): boolean =>
+    scopeManager.isKnownSession(sessionID);
 
   // 4. Track app-configured audit policy blocks by precedence source.
   let appAuditConfig: AppLevelImprovementAuditPolicy | undefined;
@@ -179,7 +180,7 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       input: { sessionID: string; id?: string; type?: string; title?: string },
       output: { status: "ask" | "deny" | "allow" },
     ) => {
-      const isArchitect = scopeManager.isKnownSession(input.sessionID);
+      const isArchitect = isAutoApprovableSession(input.sessionID);
       log.info("permission.ask fired", {
         sessionID: input.sessionID,
         permissionID: input.id,
@@ -203,7 +204,7 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       if (e?.type === "permission.updated" && e.properties) {
         const props = e.properties as { sessionID?: string; id?: string };
         const { sessionID, id: permissionID } = props;
-        if (sessionID && permissionID && scopeManager.isKnownSession(sessionID)) {
+          if (sessionID && permissionID && isAutoApprovableSession(sessionID)) {
           log.info("Auto-approving permission for architect sub-session via API", {
             sessionID,
             permissionID,
@@ -348,10 +349,12 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
           if (!parsedArgs.ok) {
             return `Invalid architect args: ${parsedArgs.error}`;
           }
-
+          
           let runId: string | undefined;
+          let runSessions: Set<string>;
           try {
-            runId = scopeManager.startRun(toolCtx.sessionID, architectSessions);
+            runSessions = new Set<string>();
+            runId = scopeManager.startRun(toolCtx.sessionID);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return `Cannot start architect run: ${message}`;
@@ -458,7 +461,14 @@ ${audit.summary}`;
                 config,
                 abort: toolCtx.abort,
                 serverUrl: ctx.serverUrl?.toString(),
-                architectSessions,
+                architectSessions: runSessions,
+                onSessionCreated: async (sessionID) => {
+                  if (!runId) {
+                    return { ok: false, reason: "run-not-found" as const };
+                  }
+
+                  return scopeManager.attachSession(runId, sessionID);
+                },
                 onRound: (round) => {
                   log.debug("Debate round completed", {
                     round: round.round,
@@ -503,17 +513,24 @@ ${audit.summary}`;
               config,
               abort: toolCtx.abort,
               serverUrl: ctx.serverUrl?.toString(),
-              architectSessions,
-                onRound: (round) => {
-                  log.debug("Debate round completed", {
-                    round: round.round,
-                    approved: round.verdict?.approved,
-                    score: round.verdict?.score,
-                  });
-                },
-                onVisibility: emitArchitectVisibility,
-                onStatus: emitArchitectStatus,
-              });
+              architectSessions: runSessions,
+              onSessionCreated: async (sessionID) => {
+                if (!runId) {
+                  return { ok: false, reason: "run-not-found" as const };
+                }
+
+                return scopeManager.attachSession(runId, sessionID);
+              },
+              onRound: (round) => {
+                log.debug("Debate round completed", {
+                  round: round.round,
+                  approved: round.verdict?.approved,
+                  score: round.verdict?.score,
+                });
+              },
+              onVisibility: emitArchitectVisibility,
+              onStatus: emitArchitectStatus,
+            });
 
             return formatCondensedResult(
               result.finalDesign,

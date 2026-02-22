@@ -6,17 +6,19 @@ export interface ArchitectRunScope {
   sessions: Set<string>;
 }
 
+export type AttachResult =
+  | { ok: true }
+  | { ok: false; reason: "run-not-found" | "run-ended" | "duplicate-session" };
+
 export class ArchitectRunScopeManager {
   private readonly runs = new Map<string, ArchitectRunScope>();
+  private readonly sessionToRun = new Map<string, string>();
 
-  startRun(rootSessionID: string, sessionSet?: Set<string>): string {
+  startRun(rootSessionID: string): string {
     const existing = this.runs.get(rootSessionID);
     if (existing && existing.state === "running") {
       throw new Error(`architect run already active for root session ${rootSessionID}`);
     }
-
-    const sessions = sessionSet ?? new Set<string>();
-    sessions.clear();
 
     this.runs.delete(rootSessionID);
     const run: ArchitectRunScope = {
@@ -24,17 +26,42 @@ export class ArchitectRunScopeManager {
       rootSessionID,
       startedAt: Date.now(),
       state: "running",
-      sessions,
+      sessions: new Set<string>(),
     };
     this.runs.set(rootSessionID, run);
     return rootSessionID;
   }
 
-  isKnownSession(sessionID: string): boolean {
-    for (const run of this.runs.values()) {
-      if (run.state === "running" && run.sessions.has(sessionID)) return true;
+  attachSession(runId: string, sessionID: string): AttachResult {
+    const run = this.runs.get(runId);
+    if (!run) {
+      return { ok: false, reason: "run-not-found" };
     }
-    return false;
+    if (run.state !== "running") {
+      return { ok: false, reason: "run-ended" };
+    }
+    if (this.sessionToRun.has(sessionID)) {
+      return { ok: false, reason: "duplicate-session" };
+    }
+
+    run.sessions.add(sessionID);
+    this.sessionToRun.set(sessionID, runId);
+    return { ok: true };
+  }
+
+  detachSession(runId: string, sessionID: string): void {
+    const run = this.runs.get(runId);
+    if (!run) return;
+
+    run.sessions.delete(sessionID);
+    const ownerRunId = this.sessionToRun.get(sessionID);
+    if (ownerRunId === runId) {
+      this.sessionToRun.delete(sessionID);
+    }
+  }
+
+  isKnownSession(sessionID: string): boolean {
+    return this.sessionToRun.has(sessionID);
   }
 
   isAuditSession(sessionID: string, executionMode?: string): boolean {
@@ -50,6 +77,10 @@ export class ArchitectRunScopeManager {
     if (!runId) return;
     const run = this.runs.get(runId);
     if (!run) return;
+
+    for (const sessionID of [...run.sessions]) {
+      this.detachSession(runId, sessionID);
+    }
     run.state = "ended";
     this.runs.delete(runId);
   }

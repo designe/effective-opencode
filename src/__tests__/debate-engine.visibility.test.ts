@@ -429,4 +429,68 @@ describe("debate-engine visibility callbacks", () => {
       expect(enabled).toContain("write");
     }
   });
+
+  test("registers architect sessions through callback and cleans compatibility set", async () => {
+    const client = createMockDebateClient({
+      proposer: ["Initial proposal draft"],
+      critic: ["Prep notes", verdict],
+    });
+    const directory = await mkWorkingDir();
+    tempDirs.push(directory);
+
+    const architectSessions = new Set<string>();
+    const callbacks: Array<{ role: "proposer" | "critic"; sessionID: string }> = [];
+
+    const result = await runDebate(client, {
+      directory,
+      $: mkShell() as unknown as never,
+    }, {
+      parentSessionID: "parent",
+      vision: "Register sub-sessions through callback",
+      projectContext: "Project context",
+      config,
+      abort: new AbortController().signal,
+      architectSessions,
+      onRound: () => {},
+      onSessionCreated: (sessionID, role) => {
+        callbacks.push({ role, sessionID });
+        return { ok: true };
+      },
+    });
+
+    expect(result.consensus).toBe(true);
+    expect(callbacks).toHaveLength(2);
+    expect(callbacks.map((entry) => entry.role).sort()).toEqual(["critic", "proposer"]);
+    expect(architectSessions.size).toBe(0);
+  });
+
+  test("fails fast when callback rejects a session attachment", async () => {
+    const client = createMockDebateClient({
+      proposer: ["Initial proposal draft"],
+      critic: ["Prep notes", verdict],
+    });
+    const directory = await mkWorkingDir();
+    tempDirs.push(directory);
+
+    const architectSessions = new Set<string>();
+    const run = runDebate(client, {
+      directory,
+      $: mkShell() as unknown as never,
+    }, {
+      parentSessionID: "parent",
+      vision: "Reject attachment for a child session",
+      projectContext: "Project context",
+      config,
+      abort: new AbortController().signal,
+      architectSessions,
+      onRound: () => {},
+      onSessionCreated: (_, role) => {
+        if (role === "critic") return { ok: false, reason: "duplicate-session" };
+        return { ok: true };
+      },
+    });
+
+    await expect(run).rejects.toThrow(/Failed to bind critic session/);
+    expect(architectSessions.size).toBe(0);
+  });
 });

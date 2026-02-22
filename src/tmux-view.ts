@@ -33,6 +33,35 @@ export interface TmuxDebateViewOptions {
   serverUrl?: string;
 }
 
+async function isServerReachable(url: string, timeoutMs = 1200): Promise<boolean> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+
+  const probe = new URL(parsed.toString());
+  probe.pathname = "/";
+  probe.search = "";
+  probe.hash = "";
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(probe.toString(), {
+      method: "GET",
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    return response.status >= 200 && response.status < 500;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Quote a value for safe shell execution in `tmux send-keys`.
  */
@@ -126,6 +155,20 @@ export async function createTmuxDebateView(
     return null;
   }
 
+  let attachServerUrl = opts.serverUrl;
+  if (attachServerUrl) {
+    const reachable = await isServerReachable(attachServerUrl);
+    if (!reachable) {
+      log.warn(
+        "Server URL is unreachable; skipping tmux attach view. " +
+        "Run opencode with an explicit listening port (for example `opencode --port 4096`) " +
+        "to enable live pane attachment.",
+        { serverUrl: attachServerUrl },
+      );
+      return null;
+    }
+  }
+
   try {
     // 1. Split the opencode agent's pane horizontally → right side for proposer
     const pane1Raw = await $`tmux split-window -d -h -p 45 -t ${agentPaneId} -P -F "#{pane_id}"`.text();
@@ -141,13 +184,13 @@ export async function createTmuxDebateView(
     const proposerCmd = buildOpencodeCommand({
       sessionId: opts.proposerSessionId,
       model: opts.proposerModel,
-      serverUrl: opts.serverUrl,
+      serverUrl: attachServerUrl,
     });
 
     const criticCmd = buildOpencodeCommand({
       sessionId: opts.criticSessionId,
       model: opts.criticModel,
-      serverUrl: opts.serverUrl,
+      serverUrl: attachServerUrl,
     });
 
     log.info("Launching opencode TUI in panes", {
