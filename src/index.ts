@@ -42,6 +42,7 @@ import { ContextAwareSkillLoader } from "./skills/index";
 // Refactoring Engine
 import { RefactorEngine } from "./refactor/index";
 import { TimeBudgetManager } from "./time-budget/manager";
+import { resolveTimeBudgetIntent } from "./time-budget/intent-parser";
 
 const log = createContextLogger("plugin");
 
@@ -84,19 +85,21 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
   let legacyAuditConfig: AppLevelImprovementAuditPolicy | undefined;
   const pendingTimeIntentSessions = new Set<string>();
   const timeBudgetDecisionPromptedSessions = new Set<string>();
+  const approvedTimeBudgetSessions = new Set<string>();
   const nonLeadSessions = new Set<string>();
   const sessionModelContextLimit = new Map<string, number>();
 
-  const hasNumericTimeExpression = (value: string): boolean => {
-    return /(?:\d+(?:\.\d+)?\s*(?:h|hr|hrs|hour|hours|min|mins|minute|minutes|sec|secs|second|seconds))|(?:\d+(?:\.\d+)?\s*(?:시간|분|초))/i.test(
-      value,
-    );
+  const clearTimeBudgetIntentState = (sessionID: string): void => {
+    pendingTimeIntentSessions.delete(sessionID);
+    timeBudgetDecisionPromptedSessions.delete(sessionID);
+    approvedTimeBudgetSessions.delete(sessionID);
   };
 
-  const hasTimeBudgetDeclineExpression = (value: string): boolean => {
-    return /(?:\bno\b|\bnope\b|\bwithout\b|\bskip\b|\bdon't\b|\bdo not\b|아니|괜찮|시간\s*제한\s*없이|타임\s*버짓\s*없이|제한\s*없이)/i.test(
-      value,
-    );
+  const clearTimeBudgetSessionState = (sessionID: string): void => {
+    timeBudgetManager.clearBudget(sessionID);
+    clearTimeBudgetIntentState(sessionID);
+    nonLeadSessions.delete(sessionID);
+    sessionModelContextLimit.delete(sessionID);
   };
 
   const isLeadSession = (sessionID: string, agent?: string): boolean => {
@@ -121,6 +124,45 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       .join("\n");
   };
 
+  const extractTextFromMessageLike = (message: unknown): string => {
+    if (!message || typeof message !== "object") return "";
+    const candidate = message as { parts?: unknown[]; text?: unknown };
+    if (Array.isArray(candidate.parts)) {
+      const fromParts = extractTextFromParts(candidate.parts);
+      if (fromParts) return fromParts;
+    }
+    if (typeof candidate.text === "string") return candidate.text;
+    return "";
+  };
+
+  const extractTextFromMessageList = (messages: unknown): string => {
+    if (!Array.isArray(messages)) return "";
+    return messages
+      .map((message) => {
+        if (!message || typeof message !== "object") return "";
+        const candidate = message as {
+          role?: unknown;
+          content?: unknown;
+          parts?: unknown[];
+          text?: unknown;
+        };
+        if (candidate.role && candidate.role !== "user") return "";
+        if (typeof candidate.content === "string") return candidate.content;
+        if (Array.isArray(candidate.content)) {
+          const fromContentParts = extractTextFromParts(candidate.content);
+          if (fromContentParts) return fromContentParts;
+        }
+        if (Array.isArray(candidate.parts)) {
+          const fromParts = extractTextFromParts(candidate.parts);
+          if (fromParts) return fromParts;
+        }
+        if (typeof candidate.text === "string") return candidate.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  };
+
   const formatDuration = (ms: number): string => {
     const totalSeconds = Math.max(0, Math.floor(ms / 1000));
     const hours = Math.floor(totalSeconds / 3600);
@@ -132,6 +174,29 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
     return `${minutes}m ${seconds}s`;
   };
 
+  const asUnitRatio = (value: unknown): number | undefined => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+    if (value <= 0 || value > 1) return undefined;
+    return value;
+  };
+
+  const asPositiveInt = (value: unknown): number | undefined => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      return undefined;
+    }
+    return Math.floor(value);
+  };
+
+  const parseCheckpointRatios = (value: unknown): number[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+    const parsed = value
+      .map(asUnitRatio)
+      .filter((ratio): ratio is number => ratio !== undefined)
+      .sort((a, b) => a - b);
+    if (parsed.length === 0) return undefined;
+    return [...new Set(parsed)];
+  };
+
   const applyTimeBudgetOverrides = (source: unknown) => {
     if (!source || typeof source !== "object" || Array.isArray(source)) return;
     const tb = (source as { timeBudget?: unknown }).timeBudget;
@@ -140,52 +205,34 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
     if (typeof candidate.enabled === "boolean") {
       pluginConfig.timeBudget.enabled = candidate.enabled;
     }
-    if (
-      typeof candidate.finalizingThreshold === "number" &&
-      Number.isFinite(candidate.finalizingThreshold) &&
-      candidate.finalizingThreshold > 0 &&
-      candidate.finalizingThreshold <= 1
-    ) {
-      pluginConfig.timeBudget.finalizingThreshold = candidate.finalizingThreshold;
+    const finalizingThreshold = asUnitRatio(candidate.finalizingThreshold);
+    if (finalizingThreshold !== undefined) {
+      pluginConfig.timeBudget.finalizingThreshold = finalizingThreshold;
     }
-    if (
-      typeof candidate.compactSoftThreshold === "number" &&
-      Number.isFinite(candidate.compactSoftThreshold) &&
-      candidate.compactSoftThreshold > 0 &&
-      candidate.compactSoftThreshold <= 1
-    ) {
-      pluginConfig.timeBudget.compactSoftThreshold = candidate.compactSoftThreshold;
+
+    const compactSoftThreshold = asUnitRatio(candidate.compactSoftThreshold);
+    if (compactSoftThreshold !== undefined) {
+      pluginConfig.timeBudget.compactSoftThreshold = compactSoftThreshold;
     }
-    if (
-      typeof candidate.compactHardThreshold === "number" &&
-      Number.isFinite(candidate.compactHardThreshold) &&
-      candidate.compactHardThreshold > 0 &&
-      candidate.compactHardThreshold <= 1
-    ) {
-      pluginConfig.timeBudget.compactHardThreshold = candidate.compactHardThreshold;
+
+    const compactHardThreshold = asUnitRatio(candidate.compactHardThreshold);
+    if (compactHardThreshold !== undefined) {
+      pluginConfig.timeBudget.compactHardThreshold = compactHardThreshold;
     }
-    if (
-      typeof candidate.compactCooldownMs === "number" &&
-      Number.isFinite(candidate.compactCooldownMs) &&
-      candidate.compactCooldownMs > 0
-    ) {
-      pluginConfig.timeBudget.compactCooldownMs = Math.floor(candidate.compactCooldownMs);
+
+    const compactCooldownMs = asPositiveInt(candidate.compactCooldownMs);
+    if (compactCooldownMs !== undefined) {
+      pluginConfig.timeBudget.compactCooldownMs = compactCooldownMs;
     }
-    if (
-      typeof candidate.timerChunkMs === "number" &&
-      Number.isFinite(candidate.timerChunkMs) &&
-      candidate.timerChunkMs > 0
-    ) {
-      pluginConfig.timeBudget.timerChunkMs = Math.floor(candidate.timerChunkMs);
+
+    const timerChunkMs = asPositiveInt(candidate.timerChunkMs);
+    if (timerChunkMs !== undefined) {
+      pluginConfig.timeBudget.timerChunkMs = timerChunkMs;
     }
-    if (Array.isArray(candidate.compactProgressCheckpoints)) {
-      const parsed = candidate.compactProgressCheckpoints
-        .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
-        .filter((value) => value > 0 && value <= 1)
-        .sort((a, b) => a - b);
-      if (parsed.length > 0) {
-        pluginConfig.timeBudget.compactProgressCheckpoints = [...new Set(parsed)];
-      }
+
+    const compactProgressCheckpoints = parseCheckpointRatios(candidate.compactProgressCheckpoints);
+    if (compactProgressCheckpoints) {
+      pluginConfig.timeBudget.compactProgressCheckpoints = compactProgressCheckpoints;
     }
   };
 
@@ -332,7 +379,7 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       if (e?.type === "permission.updated" && e.properties) {
         const props = e.properties as { sessionID?: string; id?: string };
         const { sessionID, id: permissionID } = props;
-          if (sessionID && permissionID && isAutoApprovableSession(sessionID)) {
+        if (sessionID && permissionID && isAutoApprovableSession(sessionID)) {
           log.info("Auto-approving permission for architect sub-session via API", {
             sessionID,
             permissionID,
@@ -356,11 +403,7 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       if (e?.type === "session.idle" && e.properties) {
         const props = e.properties as { sessionID?: string };
         if (props.sessionID) {
-          timeBudgetManager.clearBudget(props.sessionID);
-          pendingTimeIntentSessions.delete(props.sessionID);
-          timeBudgetDecisionPromptedSessions.delete(props.sessionID);
-          nonLeadSessions.delete(props.sessionID);
-          sessionModelContextLimit.delete(props.sessionID);
+          clearTimeBudgetSessionState(props.sessionID);
         }
       }
 
@@ -479,8 +522,11 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
 ## Time Budget Confirmation Required
 
 The user appears to have requested a time-constrained execution window.
-Before doing the main work, ask for an explicit choice once:
-"I can run in strict deadline mode for ~X minutes, or continue without a strict time budget. Which do you want?"
+Before doing the main work, you MUST ask for an explicit two-option multiple-choice decision via the \`question\` tool exactly once:
+- Option 1: Strict deadline mode (start \`start_time_budget\`)
+- Option 2: Continue without strict time budget
+
+Do not continue tool work until the user selects one option.
 
 If the user confirms strict deadline mode, immediately call the tool \
 \`start_time_budget\`\
@@ -496,6 +542,7 @@ If the user declines strict deadline mode, proceed normally without calling \
 ## Pending Time Budget Decision
 
 - A time-budget intent is currently pending for this session.
+- Ask (or re-ask) with the \`question\` tool using two explicit options: strict deadline mode vs continue without strict budget.
 - If the latest user reply approves strict deadline mode, call \
 \`start_time_budget\`\
  now before additional tool usage.
@@ -516,6 +563,8 @@ If the user declines strict deadline mode, proceed normally without calling \
 
 Execution policy:
 - Do not expand scope unless critical.
+- Treat the approved duration as the planned work window; do not stop early after only a minimal pass.
+- Continue meaningful analysis/verification until near the deadline, then finalize with concise handoff.
 - Prioritize completion and correctness over optional polish.
 - If budget is nearly exhausted, finish with a concise status + remaining risks.
 ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool calls and finalize now." : ""}
@@ -569,24 +618,51 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
       const leadSession = isLeadSession(input.sessionID, input.agent);
       if (!leadSession) {
         nonLeadSessions.add(input.sessionID);
-        pendingTimeIntentSessions.delete(input.sessionID);
-        timeBudgetDecisionPromptedSessions.delete(input.sessionID);
+        clearTimeBudgetIntentState(input.sessionID);
         return;
       }
       nonLeadSessions.delete(input.sessionID);
 
-      if (input.sessionID) {
-        timeBudgetManager.clearBudget(input.sessionID);
-        sessionModelContextLimit.delete(input.sessionID);
-      }
-
-      const text = extractTextFromParts(output.parts);
-      if (input.sessionID && hasNumericTimeExpression(text)) {
+      const inputPayload = input as {
+        message?: unknown;
+        parts?: unknown[];
+        text?: unknown;
+        prompt?: unknown;
+        content?: unknown;
+        messages?: unknown;
+      };
+      const text = [
+        extractTextFromParts(output.parts),
+        extractTextFromMessageLike(output.message),
+        extractTextFromParts(inputPayload.parts ?? []),
+        extractTextFromMessageLike(inputPayload.message),
+        extractTextFromMessageList(inputPayload.messages),
+        typeof inputPayload.text === "string" ? inputPayload.text : "",
+        typeof inputPayload.prompt === "string" ? inputPayload.prompt : "",
+        typeof inputPayload.content === "string" ? inputPayload.content : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+      const intent = resolveTimeBudgetIntent(text);
+      if (input.sessionID && intent.action === "decline") {
+        clearTimeBudgetIntentState(input.sessionID);
+      } else if (
+        input.sessionID &&
+        intent.action === "approve" &&
+        pendingTimeIntentSessions.has(input.sessionID) &&
+        timeBudgetDecisionPromptedSessions.has(input.sessionID)
+      ) {
+        approvedTimeBudgetSessions.add(input.sessionID);
+      } else if (input.sessionID && intent.hasNumeric) {
+        const wasPending = pendingTimeIntentSessions.has(input.sessionID);
+        const wasPrompted = timeBudgetDecisionPromptedSessions.has(input.sessionID);
         pendingTimeIntentSessions.add(input.sessionID);
-        timeBudgetDecisionPromptedSessions.delete(input.sessionID);
-      } else if (input.sessionID && hasTimeBudgetDeclineExpression(text)) {
-        pendingTimeIntentSessions.delete(input.sessionID);
-        timeBudgetDecisionPromptedSessions.delete(input.sessionID);
+        if (wasPending && wasPrompted) {
+          approvedTimeBudgetSessions.add(input.sessionID);
+        } else {
+          approvedTimeBudgetSessions.delete(input.sessionID);
+          timeBudgetDecisionPromptedSessions.delete(input.sessionID);
+        }
       }
     },
 
@@ -597,6 +673,19 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
     ) => {
       const { tool: toolName } = input;
       const args = input.args ?? output.args;
+      if (
+        pluginConfig.timeBudget.enabled &&
+        input.sessionID &&
+        toolName !== "question" &&
+        toolName !== "start_time_budget" &&
+        pendingTimeIntentSessions.has(input.sessionID) &&
+        !approvedTimeBudgetSessions.has(input.sessionID)
+      ) {
+        throw new Error(
+          "TIME_BUDGET_CONFIRMATION_REQUIRED: Ask whether to run strict deadline mode before using tools. If approved, call start_time_budget first; if declined, continue without it.",
+        );
+      }
+
       if (
         pluginConfig.timeBudget.enabled &&
         input.sessionID &&
@@ -647,10 +736,19 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
             return "Invalid minutes value. Please provide a finite number >= 1.";
           }
 
+          if (
+            pendingTimeIntentSessions.has(toolCtx.sessionID) &&
+            !approvedTimeBudgetSessions.has(toolCtx.sessionID)
+          ) {
+            return (
+              "Time budget confirmation is still pending. " +
+              "Ask the user to choose strict deadline mode vs normal mode first, then call start_time_budget after explicit approval."
+            );
+          }
+
           const durationMs = Math.floor(minutes * 60_000);
           const state = timeBudgetManager.startBudget(toolCtx.sessionID, durationMs);
-          pendingTimeIntentSessions.delete(toolCtx.sessionID);
-          timeBudgetDecisionPromptedSessions.delete(toolCtx.sessionID);
+          clearTimeBudgetIntentState(toolCtx.sessionID);
           toolCtx.metadata({
             title: `Time budget active: ${Math.round(minutes)} minute(s)`,
           });

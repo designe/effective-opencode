@@ -63,6 +63,37 @@ describe("time budget prompt scope", () => {
     }
   });
 
+  test("first prompt explicitly requires question-tool multiple choice", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "10분 동안 진행해줘" }],
+        },
+      );
+
+      const output = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        output,
+      );
+
+      const merged = output.system.join("\n");
+      expect(merged).toContain("MUST ask for an explicit two-option multiple-choice decision via the `question` tool exactly once");
+      expect(merged).toContain("Option 1: Strict deadline mode");
+      expect(merged).toContain("Option 2: Continue without strict time budget");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("does not ask subagent sessions", async () => {
     const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
     try {
@@ -87,6 +118,407 @@ describe("time budget prompt scope", () => {
 
       expect(output.system.join("\n")).not.toContain("Time Budget Confirmation Required");
       expect(output.system.join("\n")).not.toContain("Pending Time Budget Decision");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks tool execution until strict-mode decision is confirmed", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "10분 동안 리팩토링해줘" }],
+        },
+      );
+
+      await expect(
+        plugin["tool.execute.before"]?.(
+          {
+            sessionID: "lead-session",
+            tool: "bash",
+            args: { command: "git status" },
+          },
+          { args: { command: "git status" } },
+        ),
+      ).rejects.toThrow("TIME_BUDGET_CONFIRMATION_REQUIRED");
+
+      await expect(
+        plugin["tool.execute.before"]?.(
+          {
+            sessionID: "lead-session",
+            tool: "question",
+            args: {
+              questions: [
+                {
+                  question: "Choose mode",
+                  header: "Time Budget",
+                  options: [
+                    { label: "Strict", description: "Use strict mode" },
+                    { label: "Normal", description: "No strict limit" },
+                  ],
+                },
+              ],
+            },
+          },
+          {
+            args: {
+              questions: [
+                {
+                  question: "Choose mode",
+                  header: "Time Budget",
+                  options: [
+                    { label: "Strict", description: "Use strict mode" },
+                    { label: "Normal", description: "No strict limit" },
+                  ],
+                },
+              ],
+            },
+          },
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("requires explicit approval before starting strict time budget", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, unknown>;
+      const hooks = plugin as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await hooks["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "10분 동안 진행해줘" }],
+        },
+      );
+
+      const transformOut = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        transformOut,
+      );
+
+      const tools = plugin.tool as {
+        start_time_budget?: {
+          execute: (args: { minutes: number }, toolCtx: { sessionID: string; metadata: (value: unknown) => void }) => Promise<string>;
+        };
+      };
+      expect(tools.start_time_budget).toBeDefined();
+
+      const pending = await tools.start_time_budget!.execute(
+        { minutes: 10 },
+        {
+          sessionID: "lead-session",
+          metadata: () => {},
+        },
+      );
+      expect(pending).toContain("confirmation is still pending");
+
+      await hooks["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "응, 엄격 모드로 진행해줘" }],
+        },
+      );
+
+      const started = await tools.start_time_budget!.execute(
+        { minutes: 10 },
+        {
+          sessionID: "lead-session",
+          metadata: () => {},
+        },
+      );
+      expect(started).toContain("Time budget started for 10 minute(s)");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("decline response clears pending state after a numeric request", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "10분 동안 리팩토링해줘" }],
+        },
+      );
+
+      await expect(
+        plugin["tool.execute.before"]?.(
+          {
+            sessionID: "lead-session",
+            tool: "bash",
+            args: { command: "git status" },
+          },
+          { args: { command: "git status" } },
+        ),
+      ).rejects.toThrow("TIME_BUDGET_CONFIRMATION_REQUIRED");
+
+      await plugin["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "아니, 시간 제한 없이 진행해줘" }],
+        },
+      );
+
+      await expect(
+        plugin["tool.execute.before"]?.(
+          {
+            sessionID: "lead-session",
+            tool: "bash",
+            args: { command: "git status" },
+          },
+          { args: { command: "git status" } },
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps active budget across follow-up lead messages", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, unknown>;
+      const hooks = plugin as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+      const tools = plugin.tool as {
+        start_time_budget?: {
+          execute: (args: { minutes: number }, toolCtx: { sessionID: string; metadata: (value: unknown) => void }) => Promise<string>;
+        };
+      };
+
+      await hooks["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "10분 동안 진행해줘" }],
+        },
+      );
+
+      const preDecision = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        preDecision,
+      );
+
+      await hooks["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "응, 엄격 모드로 진행해줘" }],
+        },
+      );
+
+      const started = await tools.start_time_budget!.execute(
+        { minutes: 10 },
+        {
+          sessionID: "lead-session",
+          metadata: () => {},
+        },
+      );
+      expect(started).toContain("Time budget started for 10 minute(s)");
+
+      await hooks["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "좋아, 그럼 계속 진행해줘" }],
+        },
+      );
+
+      const output = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        output,
+      );
+
+      expect(output.system.join("\n")).toContain("Active Time Budget");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("detects numeric intent from input payload when output parts are empty", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        {
+          sessionID: "lead-session",
+          agent: "default",
+          parts: [{ type: "text", text: "20분 동안 진행해줘" }],
+        },
+        {
+          message: {},
+          parts: [],
+        },
+      );
+
+      const transformOutput = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        transformOutput,
+      );
+
+      expect(transformOutput.system.join("\n")).toContain("Time Budget Confirmation Required");
+
+      await expect(
+        plugin["tool.execute.before"]?.(
+          {
+            sessionID: "lead-session",
+            tool: "bash",
+            args: { command: "git status" },
+          },
+          { args: { command: "git status" } },
+        ),
+      ).rejects.toThrow("TIME_BUDGET_CONFIRMATION_REQUIRED");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("e2e: 10/20 minute intent always requires one explicit decision", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, unknown>;
+      const hooks = plugin as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+      const tools = plugin.tool as {
+        start_time_budget?: {
+          execute: (args: { minutes: number }, toolCtx: { sessionID: string; metadata: (value: unknown) => void }) => Promise<string>;
+        };
+      };
+      expect(tools.start_time_budget).toBeDefined();
+
+      await hooks["chat.message"]?.(
+        {
+          sessionID: "s-10",
+          agent: "default",
+          parts: [{ type: "text", text: "10분 동안 해줘" }],
+        },
+        { message: {}, parts: [] },
+      );
+
+      const confirm10 = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "s-10",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        confirm10,
+      );
+      expect(confirm10.system.join("\n")).toContain("Time Budget Confirmation Required");
+
+      await expect(
+        hooks["tool.execute.before"]?.(
+          {
+            sessionID: "s-10",
+            tool: "bash",
+            args: { command: "git status" },
+          },
+          { args: { command: "git status" } },
+        ),
+      ).rejects.toThrow("TIME_BUDGET_CONFIRMATION_REQUIRED");
+
+      await hooks["chat.message"]?.(
+        {
+          sessionID: "s-20",
+          agent: "default",
+          parts: [{ type: "text", text: "20분으로 진행해줘" }],
+        },
+        { message: {}, parts: [] },
+      );
+
+      const confirm20 = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "s-20",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        confirm20,
+      );
+      expect(confirm20.system.join("\n")).toContain("Time Budget Confirmation Required");
+
+      await hooks["chat.message"]?.(
+        { sessionID: "s-20", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "응, 엄격 모드로 진행해줘" }],
+        },
+      );
+
+      const started20 = await tools.start_time_budget!.execute(
+        { minutes: 20 },
+        {
+          sessionID: "s-20",
+          metadata: () => {},
+        },
+      );
+      expect(started20).toContain("Time budget started for 20 minute(s)");
+
+      await hooks["chat.message"]?.(
+        {
+          sessionID: "s-decline",
+          agent: "default",
+          parts: [{ type: "text", text: "10분 동안 점검해줘" }],
+        },
+        { message: {}, parts: [] },
+      );
+
+      const confirmDecline = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "s-decline",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        confirmDecline,
+      );
+      expect(confirmDecline.system.join("\n")).toContain("Time Budget Confirmation Required");
+
+      await hooks["chat.message"]?.(
+        { sessionID: "s-decline", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "아니, 제한 없이 진행해줘" }],
+        },
+      );
+
+      await expect(
+        hooks["tool.execute.before"]?.(
+          {
+            sessionID: "s-decline",
+            tool: "bash",
+            args: { command: "git status" },
+          },
+          { args: { command: "git status" } },
+        ),
+      ).resolves.toBeUndefined();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

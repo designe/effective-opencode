@@ -566,9 +566,31 @@ export async function runDebate(
   input: DebateInput,
 ): Promise<ProtocolResult> {
   const { vision, projectContext, config, abort } = input;
+  const initialRemainingBudgetMs =
+    typeof input.deadlineAt === "number" ? Math.max(0, input.deadlineAt - Date.now()) : undefined;
+  const hasDeadlineWindow = typeof initialRemainingBudgetMs === "number" && initialRemainingBudgetMs > 0;
+  const estimatedMinRoundMs = 4_000;
+  const budgetBoundRounds =
+    hasDeadlineWindow && initialRemainingBudgetMs
+      ? config.maxRounds + Math.ceil(initialRemainingBudgetMs / estimatedMinRoundMs)
+      : config.maxRounds;
+  const maxExtendedRounds = hasDeadlineWindow
+    ? Math.max(config.maxRounds + 24, config.maxRounds * 3, budgetBoundRounds)
+    : config.maxRounds;
   const getRemainingBudgetMs = (): number | undefined => {
     if (!input.deadlineAt) return undefined;
     return input.deadlineAt - Date.now();
+  };
+  const shouldContinueBeyondConfiguredRounds = (): boolean => {
+    if (!hasDeadlineWindow || !initialRemainingBudgetMs || initialRemainingBudgetMs <= 0) {
+      return false;
+    }
+    const remaining = getRemainingBudgetMs();
+    if (remaining === undefined || remaining <= 0) {
+      return false;
+    }
+    const elapsedRatio = Math.min(1, Math.max(0, 1 - remaining / initialRemainingBudgetMs));
+    return elapsedRatio < config.timeBudget.finalizingThreshold;
   };
   const resolveTimeoutMs = (): number => {
     const remaining = getRemainingBudgetMs();
@@ -639,8 +661,11 @@ export async function runDebate(
   };
   const getAgentLabel = (agent: "proposer" | "critic") =>
     agent === "proposer" ? "Architect-1 (Proposer)" : "Architect-2 (Critic)";
-  const formatRound = (round = 0) =>
-    round > 0 ? `Round ${round}/${config.maxRounds}` : "Setup";
+  const formatRound = (round = 0) => {
+    if (round <= 0) return "Setup";
+    if (round <= config.maxRounds) return `Round ${round}/${config.maxRounds}`;
+    return `Round ${round} (extended)`;
+  };
 
   let activeRound = 0;
   let lastLiveStatus = "";
@@ -967,14 +992,30 @@ export async function runDebate(
 
     let proposal = initialProposal;
 
-    for (let i = 0; i < config.maxRounds; i++) {
+    let consensusReached = false;
+    let consensusSummary = "";
+
+    for (let i = 0; ; i++) {
+      const withinConfiguredRounds = i < config.maxRounds;
+      const shouldExtend = !withinConfiguredRounds && shouldContinueBeyondConfiguredRounds();
+      if (!withinConfiguredRounds && !shouldExtend) {
+        break;
+      }
+      if (i >= maxExtendedRounds) {
+        log.warn("Stopping debate loop at safety cap", {
+          configuredMaxRounds: config.maxRounds,
+          maxExtendedRounds,
+          round: i + 1,
+        });
+        break;
+      }
       if ((getRemainingBudgetMs() ?? Number.POSITIVE_INFINITY) <= 0) {
         log.warn("Stopping debate loop because parent time budget expired", {
           round: i + 1,
         });
         break;
       }
-        log.info(`Round ${i + 1}/${config.maxRounds}`);
+        log.info(`Round ${i + 1}${withinConfiguredRounds ? `/${config.maxRounds}` : " (extended)"}`);
         activeRound = i + 1;
         setLiveStatus("critic", "starting review", true, i + 1);
 
@@ -1083,33 +1124,51 @@ export async function runDebate(
       // Consensus check
       const consensus = detectConsensus(critique);
       if (consensus.reached) {
-        log.info("Consensus reached!", {
-          round: i + 1,
-          summary: consensus.summary,
-        });
-        setLiveStatus("proposer", "confirmed consensus", true, i + 1, "consensus");
-        setLiveStatus("critic", "confirmed consensus", true, i + 1, "consensus");
-        emitTerminalVisibility({
-          kind: "consensus",
-          round: i + 1,
-          message: `Round ${i + 1}: Consensus reached!`,
-          variant: "success",
-        });
-        notify(`Round ${i + 1}: Consensus reached!`);
-        const transcriptPath = await saveTranscript(
-          ctx,
-          vision,
-          rounds,
-          true,
-          consensus.summary,
-        );
-        return {
-          rounds,
-          finalDesign: proposal,
-          consensus: true,
-          summary: consensus.summary,
-          transcriptPath,
-        };
+        consensusReached = true;
+        consensusSummary = consensus.summary;
+
+        if (shouldContinueBeyondConfiguredRounds()) {
+          log.info("Consensus reached early; continuing refinement within active time budget", {
+            round: i + 1,
+            summary: consensus.summary,
+          });
+          setLiveStatus("proposer", "consensus reached, continuing refinement", true, i + 1, "thinking");
+          setLiveStatus("critic", "consensus reached, continuing refinement", true, i + 1, "thinking");
+          emitVisibility({
+            kind: "round_result",
+            round: i + 1,
+            message: `Round ${i + 1}: Consensus reached; continuing refinement until finalization window`,
+            variant: "info",
+          });
+        } else {
+          log.info("Consensus reached!", {
+            round: i + 1,
+            summary: consensus.summary,
+          });
+          setLiveStatus("proposer", "confirmed consensus", true, i + 1, "consensus");
+          setLiveStatus("critic", "confirmed consensus", true, i + 1, "consensus");
+          emitTerminalVisibility({
+            kind: "consensus",
+            round: i + 1,
+            message: `Round ${i + 1}: Consensus reached!`,
+            variant: "success",
+          });
+          notify(`Round ${i + 1}: Consensus reached!`);
+          const transcriptPath = await saveTranscript(
+            ctx,
+            vision,
+            rounds,
+            true,
+            consensus.summary,
+          );
+          return {
+            rounds,
+            finalDesign: proposal,
+            consensus: true,
+            summary: consensus.summary,
+            transcriptPath,
+          };
+        }
       }
 
       // Proposer revises (skip on last round)
@@ -1131,31 +1190,46 @@ export async function runDebate(
       }
     }
 
-    log.warn("Max rounds reached without consensus", {
-      rounds: config.maxRounds,
-    });
-
-    const summary = "Max rounds reached without full consensus";
-    setLiveStatus("proposer", "completed max rounds without consensus", true, activeRound, "complete");
-    setLiveStatus("critic", "completed max rounds without consensus", true, activeRound, "complete");
-    emitTerminalVisibility({
-      kind: "complete",
-      round: activeRound,
-      message: "Max rounds reached without full consensus",
-      variant: "warning",
-    });
+    const summary = consensusReached
+      ? `${consensusSummary} (continued refinement through active time budget window)`
+      : "Max rounds reached without full consensus";
+    if (!consensusReached) {
+      log.warn("Max rounds reached without consensus", {
+        rounds: config.maxRounds,
+      });
+      setLiveStatus("proposer", "completed max rounds without consensus", true, activeRound, "complete");
+      setLiveStatus("critic", "completed max rounds without consensus", true, activeRound, "complete");
+      emitTerminalVisibility({
+        kind: "complete",
+        round: activeRound,
+        message: "Max rounds reached without full consensus",
+        variant: "warning",
+      });
+    } else {
+      log.info("Completed debate after time-budget refinement window", {
+        rounds: rounds.length,
+      });
+      setLiveStatus("proposer", "completed refinement window", true, activeRound, "consensus");
+      setLiveStatus("critic", "completed refinement window", true, activeRound, "consensus");
+      emitTerminalVisibility({
+        kind: "consensus",
+        round: activeRound,
+        message: "Consensus maintained through time-budget refinement window",
+        variant: "success",
+      });
+    }
     const transcriptPath = await saveTranscript(
       ctx,
       vision,
       rounds,
-      false,
+      consensusReached,
       summary,
     );
 
     return {
       rounds,
       finalDesign: proposal,
-      consensus: false,
+      consensus: consensusReached,
       summary,
       transcriptPath,
     };

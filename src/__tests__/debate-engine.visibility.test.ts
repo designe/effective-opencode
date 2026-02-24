@@ -319,6 +319,44 @@ describe("debate-engine visibility callbacks", () => {
     expect(terminalMessages).toEqual(["Round 1: Consensus reached!"]);
   });
 
+  test("continues refinement beyond max rounds while time budget window is active", async () => {
+    const client = createMockDebateClient({
+      proposer: [
+        "Initial proposal draft",
+        "Refined proposal A",
+        "Refined proposal B",
+        "Refined proposal C",
+      ],
+      critic: [
+        "Prep notes",
+        verdict,
+        verdict,
+        verdict,
+        verdict,
+      ],
+    });
+    const directory = await mkWorkingDir();
+    tempDirs.push(directory);
+
+    const result = await runDebate(client, {
+      directory,
+      $: mkShell() as unknown as never,
+    }, {
+      parentSessionID: "parent",
+      vision: "Sustain rounds for active time budget",
+      projectContext: "Project context",
+      config,
+      abort: new AbortController().signal,
+      deadlineAt: Date.now() + 150,
+      architectSessions: new Set(),
+      onRound: () => {},
+    });
+
+    expect(result.consensus).toBe(true);
+    expect(result.rounds.length).toBeGreaterThan(1);
+    expect(result.summary).toContain("continued refinement");
+  });
+
   test("emits one terminal event when max rounds are reached", async () => {
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
