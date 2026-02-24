@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { parseVerdict, detectConsensus } from "../consensus";
+import { parseVerdict, detectConsensus, assessCritiqueQuality } from "../consensus";
 
 describe("parseVerdict", () => {
   test("should parse valid JSON verdict block", () => {
@@ -132,5 +132,32 @@ describe("detectConsensus", () => {
 
     expect(result.reached).toBe(true);
     expect(result.summary).toContain("minor issue");
+  });
+});
+
+describe("assessCritiqueQuality", () => {
+  test("flags placeholder responses", () => {
+    const quality = assessCritiqueQuality("Planning detailed architecture design");
+    expect(quality.ok).toBe(false);
+    expect(quality.reason).toBe("placeholder_response");
+  });
+
+  test("flags responses without verdict", () => {
+    const quality = assessCritiqueQuality("Concrete critique but no verdict block");
+    expect(quality.ok).toBe(false);
+    expect(quality.reason).toBe("missing_verdict");
+  });
+
+  test("accepts valid critique with verdict", () => {
+    const quality = assessCritiqueQuality(
+      [
+        "Strengths: clear module boundaries.",
+        "Weaknesses: retry policy is underspecified.",
+        "```json:verdict",
+        '{ "approved": false, "score": 6, "key_issues": ["define retry backoff"] }',
+        "```",
+      ].join("\n"),
+    );
+    expect(quality.ok).toBe(true);
   });
 });

@@ -3,6 +3,34 @@ import { createContextLogger } from "./logger";
 
 const log = createContextLogger("consensus");
 
+const PLACEHOLDER_PATTERNS = [
+  "planning detailed architecture design",
+  "drafting detailed revised proposal",
+  "finalizing revised design response",
+  "placeholder",
+];
+
+export function assessCritiqueQuality(response: string): {
+  ok: boolean;
+  reason?: "empty_response" | "placeholder_response" | "missing_verdict";
+} {
+  const trimmed = response.trim();
+  if (!trimmed) {
+    return { ok: false, reason: "empty_response" };
+  }
+
+  const normalized = trimmed.toLowerCase();
+  if (PLACEHOLDER_PATTERNS.some((pattern) => normalized.includes(pattern))) {
+    return { ok: false, reason: "placeholder_response" };
+  }
+
+  if (!parseVerdict(trimmed)) {
+    return { ok: false, reason: "missing_verdict" };
+  }
+
+  return { ok: true };
+}
+
 /**
  * Parse a structured verdict from an architect's response.
  * Primary: ```json:verdict fenced block.

@@ -1,4 +1,4 @@
-import { parseVerdict, detectConsensus } from "./consensus";
+import { parseVerdict, detectConsensus, assessCritiqueQuality } from "./consensus";
 import {
   type PluginConfig,
   type PluginInput,
@@ -593,9 +593,7 @@ export async function runDebate(
     return elapsedRatio < config.timeBudget.finalizingThreshold;
   };
   const resolveTimeoutMs = (): number => {
-    const remaining = getRemainingBudgetMs();
-    if (remaining === undefined) return config.timeoutMs;
-    return Math.max(1_000, Math.min(config.timeoutMs, remaining));
+    return config.timeoutMs;
   };
   const emitToLegacyStatus = (status: string) => {
     if (!input.onStatus) return;
@@ -661,6 +659,16 @@ export async function runDebate(
   };
   const getAgentLabel = (agent: "proposer" | "critic") =>
     agent === "proposer" ? "Architect-1 (Proposer)" : "Architect-2 (Critic)";
+  const formatQualityReason = (reason: "empty_response" | "placeholder_response" | "missing_verdict") => {
+    switch (reason) {
+      case "empty_response":
+        return "empty response";
+      case "placeholder_response":
+        return "placeholder response";
+      case "missing_verdict":
+        return "missing verdict block";
+    }
+  };
   const formatRound = (round = 0) => {
     if (round <= 0) return "Setup";
     if (round <= config.maxRounds) return `Round ${round}/${config.maxRounds}`;
@@ -994,6 +1002,7 @@ export async function runDebate(
 
     let consensusReached = false;
     let consensusSummary = "";
+    let qualityRetryCount = 0;
 
     for (let i = 0; ; i++) {
       const withinConfiguredRounds = i < config.maxRounds;
@@ -1076,7 +1085,7 @@ export async function runDebate(
         critiquePrompt += `\n\n## Prior Review Notes (Prepared Earlier)\n${criticPreparation}\n\nUse these notes as guidance while evaluating the proposal.`;
       }
 
-      const critique = await promptWithProgress({
+      let critique = await promptWithProgress({
         agent: "critic",
         sessionID: sessions.critic,
         promptText: critiquePrompt,
@@ -1087,11 +1096,43 @@ export async function runDebate(
         phase: `reviewing proposal for round ${i + 1}/${config.maxRounds}`,
       });
 
-      const verdict = parseVerdict(critique);
+      let quality = assessCritiqueQuality(critique);
+      if (!quality.ok && quality.reason) {
+        qualityRetryCount += 1;
+        emitVisibility({
+          kind: "round_result",
+          round: i + 1,
+          agent: "critic",
+          message: `Round ${i + 1}/${config.maxRounds}: Critic quality gate triggered (${formatQualityReason(quality.reason)}), retrying once`,
+          variant: "warning",
+        });
+        critique = await promptWithProgress({
+          agent: "critic",
+          sessionID: sessions.critic,
+          promptText:
+            `${critiquePrompt}\n\nQuality gate retry instruction:\n` +
+            `Your prior response failed quality checks (${formatQualityReason(quality.reason)}). ` +
+            "Return a substantive critique and end with a valid ```json:verdict``` block.",
+          timeoutMs: resolveTimeoutMs(),
+          model: criticModel,
+          leadModel: config.leadModel,
+          round: i + 1,
+          phase: `retrying critique for round ${i + 1}/${config.maxRounds}`,
+        });
+        quality = assessCritiqueQuality(critique);
+      }
+
+      const verdict = quality.ok ? parseVerdict(critique) : null;
       if (verdict) {
         log.debug("Verdict parsed", {
           approved: verdict.approved,
           score: verdict.score,
+        });
+      }
+      if (!quality.ok && quality.reason) {
+        log.warn("Critique failed quality gate after retry", {
+          round: i + 1,
+          reason: quality.reason,
         });
       }
 
@@ -1122,10 +1163,14 @@ export async function runDebate(
       });
 
       // Consensus check
-      const consensus = detectConsensus(critique);
+      const consensus = quality.ok ? detectConsensus(critique) : { reached: false, summary: "" };
       if (consensus.reached) {
+        const qualityNote =
+          qualityRetryCount > 0
+            ? `Quality retry used: yes (${qualityRetryCount})`
+            : "Quality retry used: no";
         consensusReached = true;
-        consensusSummary = consensus.summary;
+        consensusSummary = `${consensus.summary} · ${qualityNote}`;
 
         if (shouldContinueBeyondConfiguredRounds()) {
           log.info("Consensus reached early; continuing refinement within active time budget", {
@@ -1159,20 +1204,23 @@ export async function runDebate(
             vision,
             rounds,
             true,
-            consensus.summary,
+            consensusSummary,
           );
           return {
             rounds,
             finalDesign: proposal,
             consensus: true,
-            summary: consensus.summary,
+            summary: consensusSummary,
             transcriptPath,
           };
         }
       }
 
-      // Proposer revises (skip on last round)
-      if (i < config.maxRounds - 1) {
+      // Proposer revises whenever another round is expected.
+      // This includes extended rounds while the active time-budget window is still open.
+      const shouldRequestRevision =
+        i < config.maxRounds - 1 || shouldContinueBeyondConfiguredRounds();
+      if (shouldRequestRevision) {
         if ((getRemainingBudgetMs() ?? Number.POSITIVE_INFINITY) <= 0) {
           break;
         }
@@ -1190,9 +1238,13 @@ export async function runDebate(
       }
     }
 
+    const qualityNote =
+      qualityRetryCount > 0
+        ? `Quality retry used: yes (${qualityRetryCount})`
+        : "Quality retry used: no";
     const summary = consensusReached
       ? `${consensusSummary} (continued refinement through active time budget window)`
-      : "Max rounds reached without full consensus";
+      : `Max rounds reached without full consensus · ${qualityNote}`;
     if (!consensusReached) {
       log.warn("Max rounds reached without consensus", {
         rounds: config.maxRounds,
@@ -1270,15 +1322,10 @@ export async function runDebate(
 
     if (!config.retainSessions) {
       log.debug("Cleaning up sessions");
-      if (sessions.proposer) {
+      for (const sessionID of new Set(createdSessions)) {
         await client.session
-          .delete({ path: { id: sessions.proposer } })
-          .catch((e) => log.warn("Failed to delete proposer session", e));
-      }
-      if (sessions.critic) {
-        await client.session
-          .delete({ path: { id: sessions.critic } })
-          .catch((e) => log.warn("Failed to delete critic session", e));
+          .delete({ path: { id: sessionID } })
+          .catch((e) => log.warn("Failed to delete architect session", { sessionID, error: e }));
       }
     }
   }

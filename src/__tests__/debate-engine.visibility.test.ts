@@ -61,6 +61,11 @@ const createMockDebateClient = (responses: {
   proposer: string[];
   critic: string[];
   onCreate?: (body: SessionCreateBody) => void;
+  onDelete?: (sessionID: string) => void;
+  proposerPromptDelayMs?: number;
+  criticPromptDelayMs?: number;
+  proposerPromptDelayByCallMs?: number[];
+  criticPromptDelayByCallMs?: number[];
 }): OpencodeClient => {
   const sessions = new Map<string, MockSessionState>();
   let nextSessionId = 0;
@@ -112,6 +117,15 @@ const createMockDebateClient = (responses: {
         const sessionId = path?.id as string;
         const state = sessions.get(sessionId);
         if (!state) throw new Error(`Unknown session: ${sessionId}`);
+        const delayByCall = state.role === "proposer"
+          ? responses.proposerPromptDelayByCallMs
+          : responses.criticPromptDelayByCallMs;
+        const delayMs = delayByCall?.[state.calls] ?? (state.role === "proposer"
+          ? responses.proposerPromptDelayMs
+          : responses.criticPromptDelayMs);
+        if (typeof delayMs === "number" && delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
         const text = body?.parts?.[0]?.text ?? "";
         const response = getNextResponse(sessionId, text);
         const message = createMessage(response);
@@ -157,7 +171,8 @@ const createMockDebateClient = (responses: {
         return { data: message };
       },
 
-      delete: async () => {
+      delete: async ({ path }: { path?: { id?: string } }) => {
+        if (path?.id) responses.onDelete?.(path.id);
         return { data: true };
       },
 
@@ -355,6 +370,35 @@ describe("debate-engine visibility callbacks", () => {
     expect(result.consensus).toBe(true);
     expect(result.rounds.length).toBeGreaterThan(1);
     expect(result.summary).toContain("continued refinement");
+    expect(result.rounds.some((round) => round.proposal !== "Initial proposal draft")).toBe(true);
+  });
+
+  test("finishes the active round even if deadline expires mid-round", async () => {
+    const client = createMockDebateClient({
+      proposer: ["Initial proposal draft"],
+      critic: ["Prep notes", rejectedVerdict],
+      criticPromptDelayByCallMs: [0, 1_200],
+    });
+    const directory = await mkWorkingDir();
+    tempDirs.push(directory);
+
+    const result = await runDebate(client, {
+      directory,
+      $: mkShell() as unknown as never,
+    }, {
+      parentSessionID: "parent",
+      vision: "Finish current round on budget expiry",
+      projectContext: "Project context",
+      config,
+      abort: new AbortController().signal,
+      deadlineAt: Date.now() + 300,
+      architectSessions: new Set(),
+      onRound: () => {},
+    });
+
+    expect(result.consensus).toBe(false);
+    expect(result.rounds).toHaveLength(1);
+    expect(result.summary).toBe("Max rounds reached without full consensus · Quality retry used: no");
   });
 
   test("emits one terminal event when max rounds are reached", async () => {
@@ -388,6 +432,31 @@ describe("debate-engine visibility callbacks", () => {
     expect(result.consensus).toBe(false);
     expect(result.rounds).toHaveLength(1);
     expect(terminalMessages).toEqual(["Max rounds reached without full consensus"]);
+  });
+
+  test("retries low-quality critique once and reports retry usage", async () => {
+    const client = createMockDebateClient({
+      proposer: ["Initial proposal draft"],
+      critic: ["Prep notes", "Planning detailed architecture design", verdict],
+    });
+    const directory = await mkWorkingDir();
+    tempDirs.push(directory);
+
+    const result = await runDebate(client, {
+      directory,
+      $: mkShell() as unknown as never,
+    }, {
+      parentSessionID: "parent",
+      vision: "Retry invalid critic output",
+      projectContext: "Project context",
+      config,
+      abort: new AbortController().signal,
+      architectSessions: new Set(),
+      onRound: () => {},
+    });
+
+    expect(result.consensus).toBe(true);
+    expect(result.summary).toContain("Quality retry used: yes (1)");
   });
 
   test("falls back to onStatus when onVisibility is missing", async () => {
@@ -504,9 +573,13 @@ describe("debate-engine visibility callbacks", () => {
   });
 
   test("fails fast when callback rejects a session attachment", async () => {
+    const deletedSessions: string[] = [];
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
       critic: ["Prep notes", verdict],
+      onDelete: (sessionID) => {
+        deletedSessions.push(sessionID);
+      },
     });
     const directory = await mkWorkingDir();
     tempDirs.push(directory);
@@ -531,5 +604,6 @@ describe("debate-engine visibility callbacks", () => {
 
     await expect(run).rejects.toThrow(/Failed to bind critic session/);
     expect(architectSessions.size).toBe(0);
+    expect(deletedSessions.sort()).toEqual(["session-1", "session-2"]);
   });
 });
