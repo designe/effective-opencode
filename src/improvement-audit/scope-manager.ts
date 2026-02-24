@@ -90,12 +90,10 @@ export class ArchitectRunScopeManager {
   }
 
   getRunBySession(sessionID: string): ArchitectRunScope | undefined {
-    for (const run of this.runs.values()) {
-      if (run.rootSessionID === sessionID) return run;
-      if (run.sessions.has(sessionID)) return run;
-    }
-
-    return undefined;
+    const runId = this.runs.has(sessionID)
+      ? sessionID
+      : this.sessionToRun.get(sessionID);
+    return runId ? this.runs.get(runId) : undefined;
   }
 
   listSessions(runId: string): string[] {

@@ -1,6 +1,6 @@
 {
   "name": "effective-opencode",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pair programming plugin for opencode — two AI architects debate designs to consensus",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

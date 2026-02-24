@@ -83,12 +83,27 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
   let appAuditConfig: AppLevelImprovementAuditPolicy | undefined;
   let legacyAuditConfig: AppLevelImprovementAuditPolicy | undefined;
   const pendingTimeIntentSessions = new Set<string>();
+  const timeBudgetDecisionPromptedSessions = new Set<string>();
+  const nonLeadSessions = new Set<string>();
   const sessionModelContextLimit = new Map<string, number>();
 
   const hasNumericTimeExpression = (value: string): boolean => {
     return /(?:\d+(?:\.\d+)?\s*(?:h|hr|hrs|hour|hours|min|mins|minute|minutes|sec|secs|second|seconds))|(?:\d+(?:\.\d+)?\s*(?:시간|분|초))/i.test(
       value,
     );
+  };
+
+  const hasTimeBudgetDeclineExpression = (value: string): boolean => {
+    return /(?:\bno\b|\bnope\b|\bwithout\b|\bskip\b|\bdon't\b|\bdo not\b|아니|괜찮|시간\s*제한\s*없이|타임\s*버짓\s*없이|제한\s*없이)/i.test(
+      value,
+    );
+  };
+
+  const isLeadSession = (sessionID: string, agent?: string): boolean => {
+    if (scopeManager.isKnownSession(sessionID)) return false;
+    if (!agent) return true;
+    const normalized = agent.trim().toLowerCase();
+    return normalized === "default" || normalized === "lead";
   };
 
   const extractTextFromParts = (parts: unknown[]): string => {
@@ -343,6 +358,8 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
         if (props.sessionID) {
           timeBudgetManager.clearBudget(props.sessionID);
           pendingTimeIntentSessions.delete(props.sessionID);
+          timeBudgetDecisionPromptedSessions.delete(props.sessionID);
+          nonLeadSessions.delete(props.sessionID);
           sessionModelContextLimit.delete(props.sessionID);
         }
       }
@@ -443,6 +460,10 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       }
 
       if (pluginConfig.timeBudget.enabled && input.sessionID) {
+        if (nonLeadSessions.has(input.sessionID) || scopeManager.isKnownSession(input.sessionID)) {
+          return;
+        }
+
         const contextLimit = (input.model as { limit?: { context?: number } } | undefined)?.limit
           ?.context;
         if (typeof contextLimit === "number" && contextLimit > 0) {
@@ -452,16 +473,33 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
         const hasPendingIntent = pendingTimeIntentSessions.has(input.sessionID);
         const snapshot = timeBudgetManager.getSnapshot(input.sessionID);
         if (hasPendingIntent && !snapshot) {
-          output.system.push(`
+          if (!timeBudgetDecisionPromptedSessions.has(input.sessionID)) {
+            timeBudgetDecisionPromptedSessions.add(input.sessionID);
+            output.system.push(`
 ## Time Budget Confirmation Required
 
 The user appears to have requested a time-constrained execution window.
-Before doing the main work, explicitly confirm the proposed duration with the user using this pattern:
-"I will work for ~X minutes/hours under a strict deadline. Should I start now?"
+Before doing the main work, ask for an explicit choice once:
+"I can run in strict deadline mode for ~X minutes, or continue without a strict time budget. Which do you want?"
 
-If the user confirms, immediately call the tool \
+If the user confirms strict deadline mode, immediately call the tool \
 \`start_time_budget\`\
  with the approved duration in minutes, then proceed.
+
+If the user declines strict deadline mode, proceed normally without calling \
+\`start_time_budget\`\
+.
+`);
+          }
+
+          output.system.push(`
+## Pending Time Budget Decision
+
+- A time-budget intent is currently pending for this session.
+- If the latest user reply approves strict deadline mode, call \
+\`start_time_budget\`\
+ now before additional tool usage.
+- If the latest user reply declines strict deadline mode, continue normally and do not call the tool.
 `);
         }
 
@@ -528,6 +566,15 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
 
       if (!pluginConfig.timeBudget.enabled) return;
 
+      const leadSession = isLeadSession(input.sessionID, input.agent);
+      if (!leadSession) {
+        nonLeadSessions.add(input.sessionID);
+        pendingTimeIntentSessions.delete(input.sessionID);
+        timeBudgetDecisionPromptedSessions.delete(input.sessionID);
+        return;
+      }
+      nonLeadSessions.delete(input.sessionID);
+
       if (input.sessionID) {
         timeBudgetManager.clearBudget(input.sessionID);
         sessionModelContextLimit.delete(input.sessionID);
@@ -536,8 +583,10 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
       const text = extractTextFromParts(output.parts);
       if (input.sessionID && hasNumericTimeExpression(text)) {
         pendingTimeIntentSessions.add(input.sessionID);
-      } else if (input.sessionID) {
+        timeBudgetDecisionPromptedSessions.delete(input.sessionID);
+      } else if (input.sessionID && hasTimeBudgetDeclineExpression(text)) {
         pendingTimeIntentSessions.delete(input.sessionID);
+        timeBudgetDecisionPromptedSessions.delete(input.sessionID);
       }
     },
 
@@ -601,6 +650,7 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
           const durationMs = Math.floor(minutes * 60_000);
           const state = timeBudgetManager.startBudget(toolCtx.sessionID, durationMs);
           pendingTimeIntentSessions.delete(toolCtx.sessionID);
+          timeBudgetDecisionPromptedSessions.delete(toolCtx.sessionID);
           toolCtx.metadata({
             title: `Time budget active: ${Math.round(minutes)} minute(s)`,
           });
@@ -675,6 +725,12 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
           let lastToastMessage = "";
           let lastToastAt = 0;
           let toastEnabled = true;
+          const resolveIncludeAuditOutput = (
+            value: boolean | undefined,
+            defaultValue: boolean,
+          ): boolean => {
+            return typeof value === "boolean" ? value : defaultValue;
+          };
           const emitArchitectVisibility = (
             event: {
               kind: string;
@@ -732,38 +788,11 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
           try {
             const policy = resolveAuditPolicy(parsedArgs.value);
             const config: PluginConfig = buildDebateConfig(parsedArgs.value, policy);
-            if (parsedArgs.value.executionMode === "improvement-audit") {
-              let audit: ImprovementAuditOutcome;
-              try {
-                audit = await runImprovementAudit(ctx.directory, policy);
-              } catch (error) {
-                log.error("Improvement audit failed", {
-                  sessionID: toolCtx.sessionID,
-                  error,
-                });
-                audit = buildSyntheticAuditFailureOutcome(ctx.directory, error);
-              }
-
-              if (policy.fallbackMode === "returnPartial" && audit.status !== "healthy") {
-                const partial = `## Improvement Audit
-
-Status: ${audit.status}
-${audit.summary}`;
-                const includeAuditOutput =
-                  typeof parsedArgs.value.includeAuditOutput === "boolean"
-                    ? parsedArgs.value.includeAuditOutput
-                    : policy.includeAuditOutputDefault;
-                return includeAuditOutput
-                  ? appendAuditSummary(partial, audit)
-                  : partial + "\n\nDebate was skipped due to returnPartial audit mode.";
-              }
-
-              const projectContext = await gatherProjectContext(ctx);
-              const vision = buildAuditVision(parsedArgs.value.vision, audit);
-              const result = await runDebate(ctx.client, ctx, {
+            const runScopedDebate = (vision: string, context: string) =>
+              runDebate(ctx.client, ctx, {
                 parentSessionID: toolCtx.sessionID,
                 vision,
-                projectContext,
+                projectContext: context,
                 config,
                 abort: toolCtx.abort,
                 deadlineAt:
@@ -790,6 +819,36 @@ ${audit.summary}`;
                 onStatus: emitArchitectStatus,
               });
 
+            if (parsedArgs.value.executionMode === "improvement-audit") {
+              let audit: ImprovementAuditOutcome;
+              try {
+                audit = await runImprovementAudit(ctx.directory, policy);
+              } catch (error) {
+                log.error("Improvement audit failed", {
+                  sessionID: toolCtx.sessionID,
+                  error,
+                });
+                audit = buildSyntheticAuditFailureOutcome(ctx.directory, error);
+              }
+
+              if (policy.fallbackMode === "returnPartial" && audit.status !== "healthy") {
+                const partial = `## Improvement Audit
+
+Status: ${audit.status}
+${audit.summary}`;
+                const includeAuditOutput = resolveIncludeAuditOutput(
+                  parsedArgs.value.includeAuditOutput,
+                  policy.includeAuditOutputDefault,
+                );
+                return includeAuditOutput
+                  ? appendAuditSummary(partial, audit)
+                  : partial + "\n\nDebate was skipped due to returnPartial audit mode.";
+              }
+
+              const projectContext = await gatherProjectContext(ctx);
+              const vision = buildAuditVision(parsedArgs.value.vision, audit);
+              const result = await runScopedDebate(vision, projectContext);
+
               const baseline = formatCondensedResult(
                 result.finalDesign,
                 result.consensus,
@@ -797,10 +856,10 @@ ${audit.summary}`;
                 result.rounds.length,
                 result.transcriptPath,
               );
-              const includeAuditOutput =
-                typeof parsedArgs.value.includeAuditOutput === "boolean"
-                  ? parsedArgs.value.includeAuditOutput
-                  : policy.includeAuditOutputDefault;
+              const includeAuditOutput = resolveIncludeAuditOutput(
+                parsedArgs.value.includeAuditOutput,
+                policy.includeAuditOutputDefault,
+              );
               if (includeAuditOutput) {
                 return appendAuditSummary(baseline, audit);
               }
@@ -816,35 +875,7 @@ ${audit.summary}`;
             }
 
             const projectContext = await gatherProjectContext(ctx);
-            const result = await runDebate(ctx.client, ctx, {
-              parentSessionID: toolCtx.sessionID,
-              vision: parsedArgs.value.vision,
-              projectContext,
-              config,
-              abort: toolCtx.abort,
-              deadlineAt:
-                pluginConfig.timeBudget.enabled
-                  ? timeBudgetManager.getDeadline(toolCtx.sessionID)
-                  : undefined,
-              serverUrl: ctx.serverUrl?.toString(),
-              architectSessions: runSessions,
-              onSessionCreated: async (sessionID) => {
-                if (!runId) {
-                  return { ok: false, reason: "run-not-found" as const };
-                }
-
-                return scopeManager.attachSession(runId, sessionID);
-              },
-              onRound: (round) => {
-                log.debug("Debate round completed", {
-                  round: round.round,
-                  approved: round.verdict?.approved,
-                  score: round.verdict?.score,
-                });
-              },
-              onVisibility: emitArchitectVisibility,
-              onStatus: emitArchitectStatus,
-            });
+            const result = await runScopedDebate(parsedArgs.value.vision, projectContext);
 
             return formatCondensedResult(
               result.finalDesign,
