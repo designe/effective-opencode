@@ -41,11 +41,18 @@ import { ContextAwareSkillLoader } from "./skills/index";
 
 // Refactoring Engine
 import { RefactorEngine } from "./refactor/index";
+import { TimeBudgetManager } from "./time-budget/manager";
 
 const log = createContextLogger("plugin");
 
 export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
-  let pluginConfig: PluginConfig = { ...DEFAULT_CONFIG };
+  let pluginConfig: PluginConfig = {
+    ...DEFAULT_CONFIG,
+    timeBudget: {
+      ...DEFAULT_CONFIG.timeBudget,
+      compactProgressCheckpoints: [...DEFAULT_CONFIG.timeBudget.compactProgressCheckpoints],
+    },
+  };
   const updateLeadModel = (candidate: unknown, source: string) => {
     const resolved = resolveLeadModel(candidate);
     if (!resolved) return;
@@ -75,6 +82,108 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
   // 4. Track app-configured audit policy blocks by precedence source.
   let appAuditConfig: AppLevelImprovementAuditPolicy | undefined;
   let legacyAuditConfig: AppLevelImprovementAuditPolicy | undefined;
+  const pendingTimeIntentSessions = new Set<string>();
+  const sessionModelContextLimit = new Map<string, number>();
+
+  const hasNumericTimeExpression = (value: string): boolean => {
+    return /(?:\d+(?:\.\d+)?\s*(?:h|hr|hrs|hour|hours|min|mins|minute|minutes|sec|secs|second|seconds))|(?:\d+(?:\.\d+)?\s*(?:시간|분|초))/i.test(
+      value,
+    );
+  };
+
+  const extractTextFromParts = (parts: unknown[]): string => {
+    if (!Array.isArray(parts)) return "";
+    return parts
+      .map((part) => {
+        if (!part || typeof part !== "object") return "";
+        const candidate = part as { type?: unknown; text?: unknown };
+        if (candidate.type !== "text" || typeof candidate.text !== "string") {
+          return "";
+        }
+        return candidate.text;
+      })
+      .filter(Boolean)
+      .join("\n");
+  };
+
+  const formatDuration = (ms: number): string => {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) {
+      return `${hours}h ${minutes}m ${seconds}s`;
+    }
+    return `${minutes}m ${seconds}s`;
+  };
+
+  const applyTimeBudgetOverrides = (source: unknown) => {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return;
+    const tb = (source as { timeBudget?: unknown }).timeBudget;
+    if (!tb || typeof tb !== "object" || Array.isArray(tb)) return;
+    const candidate = tb as Record<string, unknown>;
+    if (typeof candidate.enabled === "boolean") {
+      pluginConfig.timeBudget.enabled = candidate.enabled;
+    }
+    if (
+      typeof candidate.finalizingThreshold === "number" &&
+      Number.isFinite(candidate.finalizingThreshold) &&
+      candidate.finalizingThreshold > 0 &&
+      candidate.finalizingThreshold <= 1
+    ) {
+      pluginConfig.timeBudget.finalizingThreshold = candidate.finalizingThreshold;
+    }
+    if (
+      typeof candidate.compactSoftThreshold === "number" &&
+      Number.isFinite(candidate.compactSoftThreshold) &&
+      candidate.compactSoftThreshold > 0 &&
+      candidate.compactSoftThreshold <= 1
+    ) {
+      pluginConfig.timeBudget.compactSoftThreshold = candidate.compactSoftThreshold;
+    }
+    if (
+      typeof candidate.compactHardThreshold === "number" &&
+      Number.isFinite(candidate.compactHardThreshold) &&
+      candidate.compactHardThreshold > 0 &&
+      candidate.compactHardThreshold <= 1
+    ) {
+      pluginConfig.timeBudget.compactHardThreshold = candidate.compactHardThreshold;
+    }
+    if (
+      typeof candidate.compactCooldownMs === "number" &&
+      Number.isFinite(candidate.compactCooldownMs) &&
+      candidate.compactCooldownMs > 0
+    ) {
+      pluginConfig.timeBudget.compactCooldownMs = Math.floor(candidate.compactCooldownMs);
+    }
+    if (
+      typeof candidate.timerChunkMs === "number" &&
+      Number.isFinite(candidate.timerChunkMs) &&
+      candidate.timerChunkMs > 0
+    ) {
+      pluginConfig.timeBudget.timerChunkMs = Math.floor(candidate.timerChunkMs);
+    }
+    if (Array.isArray(candidate.compactProgressCheckpoints)) {
+      const parsed = candidate.compactProgressCheckpoints
+        .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
+        .filter((value) => value > 0 && value <= 1)
+        .sort((a, b) => a - b);
+      if (parsed.length > 0) {
+        pluginConfig.timeBudget.compactProgressCheckpoints = [...new Set(parsed)];
+      }
+    }
+  };
+
+  const timeBudgetManager = new TimeBudgetManager({
+    config: pluginConfig.timeBudget,
+    onExpired: async (sessionID: string) => {
+      log.warn("Time budget expired; aborting active session", { sessionID });
+      await ctx.client.session.abort({ path: { id: sessionID } }).catch((error: unknown) => {
+        log.warn("Failed to abort session on time-budget expiration", { sessionID, error });
+      });
+      timeBudgetManager.clearBudget(sessionID);
+    },
+  });
 
   const resolveAuditPolicy = (parsedArgs: ParsedArchitectArgs) => {
     const preferredPolicy = appAuditConfig ?? legacyAuditConfig;
@@ -138,6 +247,7 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
           pluginConfig.proposerModel = overrides.proposerModel;
         if (typeof overrides.criticModel === "string")
           pluginConfig.criticModel = overrides.criticModel;
+        applyTimeBudgetOverrides(overrides);
       }
 
       appAuditConfig = parseAppAuditPolicy(config?.effectiveOpencode);
@@ -225,6 +335,75 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       }
 
       // Track recently accessed files for conditional skill loading
+      if (e?.type === "session.idle" && e.properties) {
+        const props = e.properties as { sessionID?: string };
+        if (props.sessionID) {
+          timeBudgetManager.clearBudget(props.sessionID);
+          pendingTimeIntentSessions.delete(props.sessionID);
+          sessionModelContextLimit.delete(props.sessionID);
+        }
+      }
+
+      if (e?.type === "session.compacted" && e.properties) {
+        const props = e.properties as { sessionID?: string };
+        if (props.sessionID) {
+          timeBudgetManager.markCompacted(props.sessionID);
+        }
+      }
+
+      if (e?.type === "message.updated" && e.properties) {
+        const props = e.properties as {
+          info?: {
+            role?: string;
+            sessionID?: string;
+            tokens?: { input?: number };
+            time?: { completed?: number };
+          };
+        };
+        const info = props.info;
+        if (
+          info?.role === "assistant" &&
+          typeof info.sessionID === "string" &&
+          typeof info.tokens?.input === "number"
+        ) {
+          const sessionID = info.sessionID;
+          const contextLimit = sessionModelContextLimit.get(sessionID);
+          if (
+            pluginConfig.timeBudget.enabled &&
+            contextLimit &&
+            contextLimit > 0 &&
+            info.time?.completed
+          ) {
+            const usageRatio = info.tokens.input / contextLimit;
+            const decision = timeBudgetManager.evaluateCompact(sessionID, usageRatio);
+            if (decision.shouldCompact) {
+              ctx.client.session
+                .command({
+                  path: { id: sessionID },
+                  body: {
+                    command: "session.compact",
+                    arguments: "",
+                  },
+                })
+                .then(() => {
+                  timeBudgetManager.markCompacted(sessionID);
+                  log.info("Triggered session compact due to budget policy", {
+                    sessionID,
+                    reason: decision.reason,
+                    usageRatio,
+                  });
+                })
+                .catch((error: unknown) => {
+                  log.warn("Failed to trigger compact via session command", {
+                    sessionID,
+                    error,
+                  });
+                });
+            }
+          }
+        }
+      }
+
       const typedEvent = event as ToolExecuteEventPayload | null;
       if (typedEvent?.type === "tool.execute.after" && typedEvent.payload) {
         const { tool: toolName, args } = typedEvent.payload;
@@ -260,6 +439,49 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
         updateLeadModel(input.model, "experimental.chat.system.transform");
       }
 
+      if (pluginConfig.timeBudget.enabled && input.sessionID) {
+        const contextLimit = (input.model as { limit?: { context?: number } } | undefined)?.limit
+          ?.context;
+        if (typeof contextLimit === "number" && contextLimit > 0) {
+          sessionModelContextLimit.set(input.sessionID, contextLimit);
+        }
+
+        const hasPendingIntent = pendingTimeIntentSessions.has(input.sessionID);
+        const snapshot = timeBudgetManager.getSnapshot(input.sessionID);
+        if (hasPendingIntent && !snapshot) {
+          output.system.push(`
+## Time Budget Confirmation Required
+
+The user appears to have requested a time-constrained execution window.
+Before doing the main work, explicitly confirm the proposed duration with the user using this pattern:
+"I will work for ~X minutes/hours under a strict deadline. Should I start now?"
+
+If the user confirms, immediately call the tool \
+\`start_time_budget\`\
+ with the approved duration in minutes, then proceed.
+`);
+        }
+
+        if (snapshot) {
+          const remaining = formatDuration(snapshot.remainingMs);
+          const elapsedPct = Math.round(snapshot.elapsedRatio * 100);
+          const isFinalizing = snapshot.elapsedRatio >= pluginConfig.timeBudget.finalizingThreshold;
+          output.system.push(`
+## Active Time Budget
+
+- Remaining: ${remaining}
+- Elapsed: ${elapsedPct}%
+- Deadline mode: strict
+
+Execution policy:
+- Do not expand scope unless critical.
+- Prioritize completion and correctness over optional polish.
+- If budget is nearly exhausted, finish with a concise status + remaining risks.
+${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool calls and finalize now." : ""}
+`);
+        }
+      }
+
       const activeSkills = skillLoader.getActiveSkills(
         Array.from(recentContext),
       );
@@ -271,16 +493,48 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       }
     },
 
+    "experimental.session.compacting": async (
+      input: { sessionID: string },
+      output: { context: string[]; prompt?: string },
+    ) => {
+      if (!pluginConfig.timeBudget.enabled) return;
+      const snapshot = timeBudgetManager.getSnapshot(input.sessionID);
+      if (!snapshot) return;
+      output.context.push(
+        [
+          "Time-budget critical context:",
+          `- Remaining time: ${formatDuration(snapshot.remainingMs)}`,
+          `- Elapsed ratio: ${Math.round(snapshot.elapsedRatio * 100)}%`,
+          "- Preserve user constraints and unfinished tasks in the compacted summary.",
+          "- Emphasize what is complete vs what is pending so the agent can finish quickly.",
+        ].join("\n"),
+      );
+    },
+
     "chat.message": async (
       input: {
         sessionID: string;
         agent?: string;
         model?: { providerID?: string; modelID?: string; id?: string; provider?: string };
       },
-      _output: { message: unknown; parts: unknown[] },
+      output: { message: unknown; parts: unknown[] },
     ) => {
       if (input.model) {
         updateLeadModel(input.model, "chat.message");
+      }
+
+      if (!pluginConfig.timeBudget.enabled) return;
+
+      if (input.sessionID) {
+        timeBudgetManager.clearBudget(input.sessionID);
+        sessionModelContextLimit.delete(input.sessionID);
+      }
+
+      const text = extractTextFromParts(output.parts);
+      if (input.sessionID && hasNumericTimeExpression(text)) {
+        pendingTimeIntentSessions.add(input.sessionID);
+      } else if (input.sessionID) {
+        pendingTimeIntentSessions.delete(input.sessionID);
       }
     },
 
@@ -291,6 +545,23 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
     ) => {
       const { tool: toolName } = input;
       const args = input.args ?? output.args;
+      if (
+        pluginConfig.timeBudget.enabled &&
+        input.sessionID &&
+        toolName !== "start_time_budget" &&
+        timeBudgetManager.shouldBlockTools(input.sessionID)
+      ) {
+        const snapshot = timeBudgetManager.getSnapshot(input.sessionID);
+        if (snapshot?.remainingMs && snapshot.remainingMs <= 0) {
+          throw new Error(
+            "TIME_BUDGET_EXPIRED: The approved time budget is exhausted. Stop tool usage and return the best final summary immediately.",
+          );
+        }
+        throw new Error(
+          "TIME_CRITICAL: 95% of the approved time budget has been consumed. Do not run more tools; finalize and summarize now.",
+        );
+      }
+
       if (toolName === "bash" && args && typeof args.command === "string") {
         const parsed = parseBashCommand(args.command);
         const command = parsed?.command ?? args.command.trim();
@@ -306,6 +577,38 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
     },
 
     tool: {
+      start_time_budget: tool({
+        description:
+          "Start a strict time budget for the current session. Call this only after user approval of the requested duration.",
+        args: {
+          minutes: tool.schema
+            .number()
+            .describe("Approved budget duration in minutes (must be >= 1)"),
+        },
+        async execute(args, toolCtx) {
+          if (!pluginConfig.timeBudget.enabled) {
+            return "Time budget feature is disabled by configuration.";
+          }
+
+          const minutes = args.minutes;
+          if (!Number.isFinite(minutes) || minutes < 1) {
+            return "Invalid minutes value. Please provide a finite number >= 1.";
+          }
+
+          const durationMs = Math.floor(minutes * 60_000);
+          const state = timeBudgetManager.startBudget(toolCtx.sessionID, durationMs);
+          pendingTimeIntentSessions.delete(toolCtx.sessionID);
+          toolCtx.metadata({
+            title: `Time budget active: ${Math.round(minutes)} minute(s)`,
+          });
+
+          return (
+            `Time budget started for ${Math.round(minutes)} minute(s). ` +
+            `Remaining window: ${formatDuration(state.deadlineAt - Date.now())}.`
+          );
+        },
+      }),
+
       architect: tool({
         description:
           "Start a pair programming architecture session. Two AI architects will autonomously debate the design and iterate to consensus. Use when the user wants to design, plan, or architect a system or feature.",
@@ -460,6 +763,10 @@ ${audit.summary}`;
                 projectContext,
                 config,
                 abort: toolCtx.abort,
+                deadlineAt:
+                  pluginConfig.timeBudget.enabled
+                    ? timeBudgetManager.getDeadline(toolCtx.sessionID)
+                    : undefined,
                 serverUrl: ctx.serverUrl?.toString(),
                 architectSessions: runSessions,
                 onSessionCreated: async (sessionID) => {
@@ -512,6 +819,10 @@ ${audit.summary}`;
               projectContext,
               config,
               abort: toolCtx.abort,
+              deadlineAt:
+                pluginConfig.timeBudget.enabled
+                  ? timeBudgetManager.getDeadline(toolCtx.sessionID)
+                  : undefined,
               serverUrl: ctx.serverUrl?.toString(),
               architectSessions: runSessions,
               onSessionCreated: async (sessionID) => {

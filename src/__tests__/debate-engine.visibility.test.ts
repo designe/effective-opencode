@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDebate } from "../debate-engine";
 
+import { DEFAULT_CONFIG } from "../types";
 import type { DebateVisibilityEvent, DialogueRound, OpencodeClient, PluginConfig } from "../types";
 
 type MockShell = {
@@ -180,9 +181,8 @@ describe("debate-engine visibility callbacks", () => {
     TMUX_PANE: process.env.TMUX_PANE,
   };
   const config: PluginConfig = {
+    ...DEFAULT_CONFIG,
     maxRounds: 1,
-    retainSessions: false,
-    timeoutMs: 300_000,
   };
 
   const assertCreatePermissions = async (toolCtx: {

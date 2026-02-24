@@ -4,6 +4,7 @@
 
 export type { Plugin, PluginInput } from "@opencode-ai/plugin";
 export type { OpencodeClient, Message, Part, TextPart } from "@opencode-ai/sdk";
+import type { TimeBudgetConfig } from "./time-budget/types";
 
 // ============================================================================
 // Model Configuration
@@ -44,6 +45,7 @@ export interface PluginConfig {
   maxRounds: number;
   retainSessions: boolean;
   timeoutMs: number;
+  timeBudget: TimeBudgetConfig;
   proposerPersona?: string;
   criticPersona?: string;
   /** Model for proposer architect, e.g. "anthropic/claude-sonnet-4-20250514" */
@@ -56,6 +58,7 @@ export interface PluginConfig {
 
 export interface EffectiveOpencodeConfigBlock {
   improvementAudit?: import("./improvement-audit/types").AppLevelImprovementAuditPolicy;
+  timeBudget?: Partial<TimeBudgetConfig>;
   [key: string]: unknown;
 }
 
@@ -69,6 +72,7 @@ export interface ArchitectPluginConfigBlock {
   criticModel?: string;
   leadModel?: string;
   improvementAudit?: import("./improvement-audit/types").AppLevelImprovementAuditPolicy;
+  timeBudget?: Partial<TimeBudgetConfig>;
   [key: string]: unknown;
 }
 
@@ -76,6 +80,15 @@ export const DEFAULT_CONFIG: PluginConfig = {
   maxRounds: 3,
   retainSessions: false,
   timeoutMs: 300_000,
+  timeBudget: {
+    enabled: true,
+    finalizingThreshold: 0.95,
+    compactSoftThreshold: 0.65,
+    compactHardThreshold: 0.82,
+    compactCooldownMs: 600_000,
+    compactProgressCheckpoints: [0.5, 0.85],
+    timerChunkMs: 60 * 60 * 1000,
+  },
 };
 
 export const FALLBACK_MODELS = [
@@ -154,6 +167,8 @@ export interface ToolExecuteEventPayload {
  */
 export interface ToolExecuteInput {
   tool: string;
+  sessionID: string;
+  callID?: string;
   args?: Record<string, unknown>;
 }
 

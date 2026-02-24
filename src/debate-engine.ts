@@ -32,6 +32,7 @@ export interface DebateInput {
   projectContext: string;
   config: PluginConfig;
   abort: AbortSignal;
+  deadlineAt?: number;
   onRound: (round: DialogueRound) => void;
   /** Called when an architect starts or finishes a thinking step */
   onStatus?: (status: string) => void;
@@ -565,6 +566,15 @@ export async function runDebate(
   input: DebateInput,
 ): Promise<ProtocolResult> {
   const { vision, projectContext, config, abort } = input;
+  const getRemainingBudgetMs = (): number | undefined => {
+    if (!input.deadlineAt) return undefined;
+    return input.deadlineAt - Date.now();
+  };
+  const resolveTimeoutMs = (): number => {
+    const remaining = getRemainingBudgetMs();
+    if (remaining === undefined) return config.timeoutMs;
+    return Math.max(1_000, Math.min(config.timeoutMs, remaining));
+  };
   const emitToLegacyStatus = (status: string) => {
     if (!input.onStatus) return;
     try {
@@ -836,11 +846,14 @@ export async function runDebate(
     //    The TUI view is cosmetic — prompt execution doesn't depend on panes.
     log.debug("Launching tmux view, proposer draft, and critic prep in parallel");
     activeRound = 1;
+    if ((getRemainingBudgetMs() ?? Number.POSITIVE_INFINITY) <= 0) {
+      throw new Error("Debate cancelled by user: parent session time budget expired");
+    }
     const criticPreparationTask = promptWithProgress({
       agent: "critic",
       sessionID: sessions.critic,
       promptText: buildCriticPreparationPrompt(criticPersona, projectContext, vision),
-      timeoutMs: config.timeoutMs,
+      timeoutMs: resolveTimeoutMs(),
       model: criticModel,
       leadModel: config.leadModel,
       round: 0,
@@ -868,7 +881,7 @@ export async function runDebate(
         agent: "proposer",
         sessionID: sessions.proposer,
         promptText: buildInitialProposerPrompt(proposerPersona, projectContext, vision),
-        timeoutMs: config.timeoutMs,
+        timeoutMs: resolveTimeoutMs(),
         model: proposerModel,
         leadModel: config.leadModel,
         round: 1,
@@ -912,6 +925,12 @@ export async function runDebate(
     let proposal = initialProposal;
 
     for (let i = 0; i < config.maxRounds; i++) {
+      if ((getRemainingBudgetMs() ?? Number.POSITIVE_INFINITY) <= 0) {
+        log.warn("Stopping debate loop because parent time budget expired", {
+          round: i + 1,
+        });
+        break;
+      }
         log.info(`Round ${i + 1}/${config.maxRounds}`);
         activeRound = i + 1;
         setLiveStatus("critic", "starting review", true, i + 1);
@@ -933,7 +952,7 @@ export async function runDebate(
         agent: "critic",
         sessionID: sessions.critic,
         promptText: critiquePrompt,
-        timeoutMs: config.timeoutMs,
+        timeoutMs: resolveTimeoutMs(),
         model: criticModel,
         leadModel: config.leadModel,
         round: i + 1,
@@ -1008,12 +1027,15 @@ export async function runDebate(
 
       // Proposer revises (skip on last round)
       if (i < config.maxRounds - 1) {
+        if ((getRemainingBudgetMs() ?? Number.POSITIVE_INFINITY) <= 0) {
+          break;
+        }
         setLiveStatus("critic", "waiting for revised proposal", true, i + 1);
         proposal = await promptWithProgress({
           agent: "proposer",
           sessionID: sessions.proposer,
           promptText: buildRevisionPrompt(critique, verdict, rounds, i + 1),
-          timeoutMs: config.timeoutMs,
+          timeoutMs: resolveTimeoutMs(),
           model: proposerModel,
           leadModel: config.leadModel,
           round: i + 1,
