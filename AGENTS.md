@@ -171,6 +171,7 @@ All options go under `effectiveOpencode` (preferred) or `architectPlugin` in `op
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `maxRounds` | `number` | `3` | Max debate rounds |
+| `debateMode` | `"sequential" \| "parallel"` | `"sequential"` | Debate orchestration mode and tmux pane timing |
 | `retainSessions` | `boolean` | `false` | Keep sub-sessions after debate |
 | `timeoutMs` | `number` | `300000` | Per-prompt timeout (ms) |
 | `proposerModel` | `string` | auto-detect | Model for Architect-1 |

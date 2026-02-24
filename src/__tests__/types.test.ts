@@ -68,6 +68,7 @@ describe("ModelConfig", () => {
       expect(DEFAULT_CONFIG.maxRounds).toBe(3);
       expect(DEFAULT_CONFIG.retainSessions).toBe(false);
       expect(DEFAULT_CONFIG.timeoutMs).toBe(300_000);
+      expect(DEFAULT_CONFIG.debateMode).toBe("sequential");
     });
 
     test("should not force model overrides by default", () => {
@@ -80,10 +81,12 @@ describe("ModelConfig", () => {
     test("should accept model configuration", () => {
       const config: PluginConfig = {
         ...DEFAULT_CONFIG,
+        debateMode: "parallel",
         proposerModel: "anthropic/claude-sonnet-4-20250514",
         criticModel: "google/gemini-2.5-pro",
       };
 
+      expect(config.debateMode).toBe("parallel");
       expect(config.proposerModel).toBe("anthropic/claude-sonnet-4-20250514");
       expect(config.criticModel).toBe("google/gemini-2.5-pro");
     });

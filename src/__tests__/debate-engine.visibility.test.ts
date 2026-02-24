@@ -182,6 +182,7 @@ describe("debate-engine visibility callbacks", () => {
   };
   const config: PluginConfig = {
     ...DEFAULT_CONFIG,
+    debateMode: "parallel",
     maxRounds: 1,
   };
 

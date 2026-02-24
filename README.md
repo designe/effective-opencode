@@ -57,6 +57,7 @@ bun install
   ],
   "effectiveOpencode": {
     "maxRounds": 3,
+    "debateMode": "sequential",
     "retainSessions": false,
     "timeoutMs": 300000
   }
@@ -121,6 +122,12 @@ Each round follows this sequence:
 4. **Revise** — if no consensus and rounds remain, Architect-1 revises addressing the key issues
 5. Repeat from step 2
 
+In `sequential` mode, live TMUX visibility is staged:
+
+1. Proposer pane connects during setup.
+2. Critic pane is attached when critique starts.
+3. If critic pane attachment fails, debate continues with status-stream visibility.
+
 ### Consensus Detection
 
 Verdicts are parsed from fenced `json:verdict` blocks in the Critic's response:
@@ -139,9 +146,10 @@ Each effective invocation creates a **run-scoped** pair of sub-sessions:
 
 1. `ArchitectRunScopeManager.startRun(rootSessionID)` opens a fresh isolated scope.
 2. `runDebate` creates proposer and critic sessions in parallel, registering each via an `onSessionCreated` callback that calls `scopeManager.attachSession(runId, sessionID)`.
-3. If attachment fails (e.g. duplicate session ID), `runDebate` throws immediately — no partially-attached sessions are left in the permission set.
-4. The `permission.ask` and `permission.updated` hooks use a single canonical predicate `isAutoApprovableSession(id)` (backed by `scopeManager.isKnownSession`) to auto-approve tool calls from architect sub-sessions.
-5. `endRun` in `finally` atomically removes all run sessions from the scope manager, revoking auto-approval.
+3. Debate execution can run in `sequential` (default) or `parallel` mode. In sequential mode, only the proposer tmux pane is created first; critic pane attachment is deferred until critique starts.
+4. If attachment fails (e.g. duplicate session ID), `runDebate` throws immediately — no partially-attached sessions are left in the permission set.
+5. The `permission.ask` and `permission.updated` hooks use a single canonical predicate `isAutoApprovableSession(id)` (backed by `scopeManager.isKnownSession`) to auto-approve tool calls from architect sub-sessions.
+6. `endRun` in `finally` atomically removes all run sessions from the scope manager, revoking auto-approval.
 
 This design prevents cross-run session bleed when multiple effective runs execute concurrently.
 
@@ -177,6 +185,7 @@ All options go under `effectiveOpencode` (preferred) or `architectPlugin` in `op
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `maxRounds` | `number` | `3` | Maximum debate rounds before stopping |
+| `debateMode` | `"sequential" \| "parallel"` | `"sequential"` | Debate orchestration mode and tmux pane timing |
 | `retainSessions` | `boolean` | `false` | Keep sub-sessions after debate ends |
 | `timeoutMs` | `number` | `300000` | Per-prompt timeout in milliseconds |
 | `proposerModel` | `string` | auto-detect | Model for Architect-1 |
@@ -191,6 +200,7 @@ All options go under `effectiveOpencode` (preferred) or `architectPlugin` in `op
 {
   "effectiveOpencode": {
     "maxRounds": 5,
+    "debateMode": "parallel",
     "timeoutMs": 300000,
     "proposerPersona": "You are a pragmatic backend engineer who values simplicity...",
     "criticPersona": "You are a strict API designer who enforces REST conventions..."

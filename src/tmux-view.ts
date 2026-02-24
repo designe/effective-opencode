@@ -12,15 +12,15 @@ export interface TmuxPane {
 }
 
 /**
- * Manages the tmux split-pane layout with live opencode TUI instances
- * for the proposer and critic architects.
+ * Manages the tmux split-pane layout with live opencode TUI instances.
  *
  * Each pane runs a real `opencode` process attached to a specific session,
  * so the user sees the actual opencode interface — not a log tail.
  */
 export interface TmuxDebateView {
   proposer: TmuxPane;
-  critic: TmuxPane;
+  critic: TmuxPane | null;
+  ensureCriticPane: () => Promise<TmuxPane | null>;
   cleanup: () => Promise<void>;
 }
 
@@ -31,6 +31,7 @@ export interface TmuxDebateViewOptions {
   proposerModel?: string;
   criticModel?: string;
   serverUrl?: string;
+  createCriticPane?: boolean;
 }
 
 async function isServerReachable(url: string, timeoutMs = 1200): Promise<boolean> {
@@ -102,9 +103,10 @@ function buildOpencodeCommand(opts: {
 }
 
 /**
- * Create a tmux debate view with two panes, each running a live opencode TUI.
+ * Create a tmux debate view. It always creates the proposer pane and can
+ * optionally create the critic pane immediately.
  *
- * Layout:
+ * Layout (after critic pane exists):
  * ┌──────────────────────┬─────────────────────────┐
  * │  Main opencode       │  opencode TUI           │
  * │  (user's session)    │  Architect-1 (Proposer)  │
@@ -129,6 +131,7 @@ export async function createTmuxDebateView(
     proposerSessionId: opts.proposerSessionId,
     criticSessionId: opts.criticSessionId,
     serverUrl: opts.serverUrl ?? "(unset)",
+    createCriticPane: opts.createCriticPane ?? true,
   });
 
   if (!process.env.TMUX) {
@@ -175,12 +178,7 @@ export async function createTmuxDebateView(
     const proposerPaneId = pane1Raw.trim();
     log.debug("Created proposer pane", { paneId: proposerPaneId, agentPaneId });
 
-    // 2. Split proposer pane vertically → bottom-right for critic
-    const pane2Raw = await $`tmux split-window -d -v -t ${proposerPaneId} -P -F "#{pane_id}"`.text();
-    const criticPaneId = pane2Raw.trim();
-    log.debug("Created critic pane", { paneId: criticPaneId });
-
-    // 3. Launch opencode TUI in each pane, connected to their respective sessions
+    // 2. Launch opencode TUI in proposer pane
     const proposerCmd = buildOpencodeCommand({
       sessionId: opts.proposerSessionId,
       model: opts.proposerModel,
@@ -193,9 +191,8 @@ export async function createTmuxDebateView(
       serverUrl: attachServerUrl,
     });
 
-    log.info("Launching opencode TUI in panes", {
+    log.info("Launching opencode TUI in proposer pane", {
       proposer: { paneId: proposerPaneId, cmd: proposerCmd },
-      critic: { paneId: criticPaneId, cmd: criticCmd },
     });
 
     try {
@@ -206,27 +203,52 @@ export async function createTmuxDebateView(
         error: e instanceof Error ? e.message : String(e),
       });
     }
-    try {
-      await $`tmux select-pane -T "Architect-2 (Critic)" -t ${criticPaneId}`;
-    } catch (e) {
-      log.debug("Failed to set critic pane title (non-fatal)", {
-        paneId: criticPaneId,
-        error: e instanceof Error ? e.message : String(e),
-      });
-    }
-
     await $`tmux send-keys -t ${proposerPaneId} ${proposerCmd} Enter`;
-    await $`tmux send-keys -t ${criticPaneId} ${criticCmd} Enter`;
+
+    let criticPaneId: string | null = null;
+    let criticPane: TmuxPane | null = null;
+
+    const ensureCriticPane = async (): Promise<TmuxPane | null> => {
+      if (criticPane) return criticPane;
+
+      const pane2Raw = await $`tmux split-window -d -v -t ${proposerPaneId} -P -F "#{pane_id}"`.text();
+      const resolvedCriticPaneId = pane2Raw.trim();
+      criticPaneId = resolvedCriticPaneId;
+      log.debug("Created critic pane", { paneId: criticPaneId, proposerPaneId });
+
+      try {
+        await $`tmux select-pane -T "Architect-2 (Critic)" -t ${criticPaneId}`;
+      } catch (e) {
+        log.debug("Failed to set critic pane title (non-fatal)", {
+          paneId: criticPaneId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
+      await $`tmux send-keys -t ${resolvedCriticPaneId} ${criticCmd} Enter`;
+      criticPane = {
+        paneId: resolvedCriticPaneId,
+        sessionId: opts.criticSessionId,
+      };
+
+      log.info("Launched opencode TUI in critic pane", {
+        critic: { paneId: criticPaneId, cmd: criticCmd },
+      });
+
+      return criticPane;
+    };
+
+    if (opts.createCriticPane !== false) {
+      await ensureCriticPane();
+    }
 
     return {
       proposer: {
         paneId: proposerPaneId,
         sessionId: opts.proposerSessionId,
       },
-      critic: {
-        paneId: criticPaneId,
-        sessionId: opts.criticSessionId,
-      },
+      critic: criticPane,
+      ensureCriticPane,
       cleanup: async () => {
         try {
           log.debug("Cleaning up tmux panes");

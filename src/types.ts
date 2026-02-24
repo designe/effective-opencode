@@ -45,6 +45,7 @@ export interface PluginConfig {
   maxRounds: number;
   retainSessions: boolean;
   timeoutMs: number;
+  debateMode: "sequential" | "parallel";
   timeBudget: TimeBudgetConfig;
   proposerPersona?: string;
   criticPersona?: string;
@@ -57,6 +58,7 @@ export interface PluginConfig {
 }
 
 export interface EffectiveOpencodeConfigBlock {
+  debateMode?: "sequential" | "parallel";
   improvementAudit?: import("./improvement-audit/types").AppLevelImprovementAuditPolicy;
   timeBudget?: Partial<TimeBudgetConfig>;
   [key: string]: unknown;
@@ -66,6 +68,7 @@ export interface ArchitectPluginConfigBlock {
   maxRounds?: number;
   retainSessions?: boolean;
   timeoutMs?: number;
+  debateMode?: "sequential" | "parallel";
   proposerPersona?: string;
   criticPersona?: string;
   proposerModel?: string;
@@ -80,6 +83,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   maxRounds: 3,
   retainSessions: false,
   timeoutMs: 300_000,
+  debateMode: "sequential",
   timeBudget: {
     enabled: true,
     finalizingThreshold: 0.95,

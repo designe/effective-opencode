@@ -239,6 +239,9 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
           pluginConfig.retainSessions = overrides.retainSessions;
         if (typeof overrides.timeoutMs === "number")
           pluginConfig.timeoutMs = overrides.timeoutMs;
+        if (overrides.debateMode === "sequential" || overrides.debateMode === "parallel") {
+          pluginConfig.debateMode = overrides.debateMode;
+        }
         if (typeof overrides.proposerPersona === "string")
           pluginConfig.proposerPersona = overrides.proposerPersona;
         if (typeof overrides.criticPersona === "string")

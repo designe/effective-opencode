@@ -550,7 +550,7 @@ async function createArchitectSession(
  *
  * Flow:
  * 1. Create two sub-sessions (proposer + critic)
- * 2. Launch opencode TUI in tmux panes (each with its own model)
+ * 2. Launch tmux panes per debate mode (sequential: proposer first, critic later)
  * 3. Proposer proposes based on lead's vision + project context
  * 4. Critic reviews with structured JSON verdict
  * 5. Loop until consensus (approved:true AND score>=7) or maxRounds
@@ -774,11 +774,13 @@ export async function runDebate(
   const criticModel = criticModelString
     ? parseModelString(criticModelString)
     : undefined;
+  const debateMode = config.debateMode;
 
   log.info("Starting debate", {
     vision: vision.slice(0, 100),
     maxRounds: config.maxRounds,
     timeoutMs: config.timeoutMs,
+    debateMode,
     proposerModel: proposerModelString ?? "(session default)",
     criticModel: criticModelString ?? "(session default)",
   });
@@ -841,67 +843,108 @@ export async function runDebate(
       message: "Setup: architect sessions ready",
     });
 
-    // ── 2. Launch tmux panes AND start initial proposal in parallel ─
-    //    Also run critic preparation in parallel so Architect-2 does not idle.
-    //    The TUI view is cosmetic — prompt execution doesn't depend on panes.
-    log.debug("Launching tmux view, proposer draft, and critic prep in parallel");
+    // ── 2. Start proposer work and initialize tmux view ─
+    // In sequential mode, only proposer pane is opened at first.
+    // Critic pane is opened right before critique begins.
+    // In parallel mode, both panes open immediately and critic prep runs in parallel.
+    log.debug("Launching initial debate setup", { debateMode });
     activeRound = 1;
     if ((getRemainingBudgetMs() ?? Number.POSITIVE_INFINITY) <= 0) {
       throw new Error("Debate cancelled by user: parent session time budget expired");
     }
-    const criticPreparationTask = promptWithProgress({
-      agent: "critic",
-      sessionID: sessions.critic,
-      promptText: buildCriticPreparationPrompt(criticPersona, projectContext, vision),
-      timeoutMs: resolveTimeoutMs(),
-      model: criticModel,
-      leadModel: config.leadModel,
-      round: 0,
-      phase: "preparing review plan",
-    }).catch((err) => {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errMsg.includes("cancelled by user") || errMsg.includes("timed out")) {
-        throw err;
-      }
-      log.warn("Critic preparation failed; continuing without prep context", { error: errMsg });
-      setLiveStatus("critic", "prep skipped, will critique proposal", true, 0, "thinking");
-      return "";
-    });
+    let criticPreparation = "";
+    let initialProposal = "";
 
-    const [tmuxResult, initialProposal, criticPreparation] = await Promise.all([
-      createTmuxDebateView({
-        $: ctx.$,
-        proposerSessionId: sessions.proposer,
-        criticSessionId: sessions.critic,
-        proposerModel: proposerModelString,
-        criticModel: criticModelString,
-        serverUrl: input.serverUrl,
-      }),
-      promptWithProgress({
-        agent: "proposer",
-        sessionID: sessions.proposer,
-        promptText: buildInitialProposerPrompt(proposerPersona, projectContext, vision),
+    if (debateMode === "parallel") {
+      const criticPreparationTask = promptWithProgress({
+        agent: "critic",
+        sessionID: sessions.critic,
+        promptText: buildCriticPreparationPrompt(criticPersona, projectContext, vision),
         timeoutMs: resolveTimeoutMs(),
-        model: proposerModel,
+        model: criticModel,
         leadModel: config.leadModel,
-        round: 1,
-        phase: "drafting initial proposal",
-      }),
-      criticPreparationTask,
-    ]);
+        round: 0,
+        phase: "preparing review plan",
+      }).catch((err) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes("cancelled by user") || errMsg.includes("timed out")) {
+          throw err;
+        }
+        log.warn("Critic preparation failed; continuing without prep context", { error: errMsg });
+        setLiveStatus("critic", "prep skipped, will critique proposal", true, 0, "thinking");
+        return "";
+      });
+
+      const [tmuxResult, proposalResult, prepResult] = await Promise.all([
+        createTmuxDebateView({
+          $: ctx.$,
+          proposerSessionId: sessions.proposer,
+          criticSessionId: sessions.critic,
+          proposerModel: proposerModelString,
+          criticModel: criticModelString,
+          serverUrl: input.serverUrl,
+          createCriticPane: true,
+        }),
+        promptWithProgress({
+          agent: "proposer",
+          sessionID: sessions.proposer,
+          promptText: buildInitialProposerPrompt(proposerPersona, projectContext, vision),
+          timeoutMs: resolveTimeoutMs(),
+          model: proposerModel,
+          leadModel: config.leadModel,
+          round: 1,
+          phase: "drafting initial proposal",
+        }),
+        criticPreparationTask,
+      ]);
+      tmuxView = tmuxResult;
+      initialProposal = proposalResult;
+      criticPreparation = prepResult;
+    } else {
+      const [tmuxResult, proposalResult] = await Promise.all([
+        createTmuxDebateView({
+          $: ctx.$,
+          proposerSessionId: sessions.proposer,
+          criticSessionId: sessions.critic,
+          proposerModel: proposerModelString,
+          criticModel: criticModelString,
+          serverUrl: input.serverUrl,
+          createCriticPane: false,
+        }),
+        promptWithProgress({
+          agent: "proposer",
+          sessionID: sessions.proposer,
+          promptText: buildInitialProposerPrompt(proposerPersona, projectContext, vision),
+          timeoutMs: resolveTimeoutMs(),
+          model: proposerModel,
+          leadModel: config.leadModel,
+          round: 1,
+          phase: "drafting initial proposal",
+        }),
+      ]);
+      tmuxView = tmuxResult;
+      initialProposal = proposalResult;
+    }
+
     setLiveStatus("proposer", "submitted initial proposal", true, 1, "thinking");
     setLiveStatus("critic", "waiting to review initial proposal", true, 1, "thinking");
-    notify("Round 1 proposal draft and preparation completed");
+    notify(
+      debateMode === "parallel"
+        ? "Round 1 proposal draft and preparation completed"
+        : "Round 1 proposal draft completed",
+    );
 
-    tmuxView = tmuxResult;
     if (tmuxView) {
       emitVisibility({
         kind: "setup",
-        message: "Setup: connected to live TMUX panes",
+        message:
+          debateMode === "parallel"
+            ? "Setup: connected to live TMUX panes"
+            : "Setup: connected to proposer TMUX pane",
       });
-      log.info("Tmux debate view launched with opencode TUI instances", {
+      log.info("Tmux debate view launched", {
         proposerPane: tmuxView.proposer.paneId,
-        criticPane: tmuxView.critic.paneId,
+        criticPane: tmuxView.critic?.paneId ?? "(deferred)",
       });
     } else {
       emitVisibility({
@@ -936,6 +979,50 @@ export async function runDebate(
         setLiveStatus("critic", "starting review", true, i + 1);
 
       // Critic reviews
+      if (tmuxView && !tmuxView.critic) {
+        try {
+          emitVisibility({
+            kind: "setup",
+            message: "Setup: connecting critic TMUX pane",
+            agent: "critic",
+            round: i + 1,
+          });
+          const criticPane = await tmuxView.ensureCriticPane();
+          if (criticPane) {
+            emitVisibility({
+              kind: "setup",
+              message: "Setup: connected critic TMUX pane",
+              agent: "critic",
+              round: i + 1,
+            });
+            log.info("Critic tmux pane attached", {
+              paneId: criticPane.paneId,
+              round: i + 1,
+            });
+          } else {
+            emitVisibility({
+              kind: "setup",
+              message: "Setup: critic TMUX pane unavailable; continuing with status stream",
+              agent: "critic",
+              round: i + 1,
+              variant: "warning",
+            });
+          }
+        } catch (error) {
+          emitVisibility({
+            kind: "setup",
+            message: "Setup: critic TMUX pane unavailable; continuing with status stream",
+            agent: "critic",
+            round: i + 1,
+            variant: "warning",
+          });
+          log.warn("Failed to attach critic tmux pane (non-fatal)", {
+            round: i + 1,
+            error,
+          });
+        }
+      }
+
       let critiquePrompt =
         i === 0
           ? buildInitialCritiquePrompt(
