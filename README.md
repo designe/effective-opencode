@@ -15,7 +15,7 @@ They iterate back and forth until consensus is reached (Critic scores ≥ 7 and 
 Lead (you) ──► vision / requirement
                       │
               ┌───────▼────────┐
-              │  architect tool │
+              │  effective tool │
               └───────┬────────┘
                       │
          ┌────────────▼────────────┐
@@ -71,11 +71,11 @@ bun install
 opencode
 ```
 
-The `architect` and `refactor` tools are now available in your session.
+The `effective` and `refactor` tools are now available in your session.
 
 ## Tools
 
-### `architect`
+### `effective`
 
 Runs a two-agent debate to produce an architectural design. Simply describe what you want to build — the LLM will call the tool when a design session would be valuable.
 
@@ -135,7 +135,7 @@ A keyword fallback (`APPROVED: ...`) handles cases where the model doesn't produ
 
 ### Session Lifecycle & Permission Safety
 
-Each architect invocation creates a **run-scoped** pair of sub-sessions:
+Each effective invocation creates a **run-scoped** pair of sub-sessions:
 
 1. `ArchitectRunScopeManager.startRun(rootSessionID)` opens a fresh isolated scope.
 2. `runDebate` creates proposer and critic sessions in parallel, registering each via an `onSessionCreated` callback that calls `scopeManager.attachSession(runId, sessionID)`.
@@ -143,7 +143,7 @@ Each architect invocation creates a **run-scoped** pair of sub-sessions:
 4. The `permission.ask` and `permission.updated` hooks use a single canonical predicate `isAutoApprovableSession(id)` (backed by `scopeManager.isKnownSession`) to auto-approve tool calls from architect sub-sessions.
 5. `endRun` in `finally` atomically removes all run sessions from the scope manager, revoking auto-approval.
 
-This design prevents cross-run session bleed when multiple architect runs execute concurrently.
+This design prevents cross-run session bleed when multiple effective runs execute concurrently.
 
 ### Project Context
 

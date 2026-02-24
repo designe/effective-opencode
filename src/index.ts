@@ -609,7 +609,7 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
         },
       }),
 
-      architect: tool({
+      effective: tool({
         description:
           "Start a pair programming architecture session. Two AI architects will autonomously debate the design and iterate to consensus. Use when the user wants to design, plan, or architect a system or feature.",
         args: {
@@ -638,19 +638,19 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
             .describe("Audit strictness profile for improvement-audit mode"),
         },
         async execute(args, toolCtx) {
-          // Guard against recursive architect invocations from architect
+          // Guard against recursive effective invocations from architect
           // sub-sessions. These sessions are intended to respond to prompts,
           // not to spawn nested debate loops.
           if (scopeManager.isKnownSession(toolCtx.sessionID)) {
-            log.warn("Blocked recursive architect invocation from architect sub-session", {
+            log.warn("Blocked recursive effective invocation from architect sub-session", {
               sessionID: toolCtx.sessionID,
             });
-            return "Architect sub-sessions cannot invoke the architect tool recursively. Continuing current debate flow.";
+            return "Architect sub-sessions cannot invoke the effective tool recursively. Continuing current debate flow.";
           }
 
           const parsedArgs = parseArchitectArgs(args);
           if (!parsedArgs.ok) {
-            return `Invalid architect args: ${parsedArgs.error}`;
+            return `Invalid effective args: ${parsedArgs.error}`;
           }
           
           let runId: string | undefined;
@@ -660,7 +660,7 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
             runId = scopeManager.startRun(toolCtx.sessionID);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            return `Cannot start architect run: ${message}`;
+            return `Cannot start effective run: ${message}`;
           }
 
           let lastMetaTitle = "";

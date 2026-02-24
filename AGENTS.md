@@ -14,7 +14,7 @@ It is based on the current source code.
 
 ## 2. Core Tool Surfaces
 
-### `architect`
+### `effective`
 - Runs a two-agent architecture debate loop to consensus.
 - Creates proposer/critic sub-sessions, prompts them round-by-round, parses verdicts, returns final design.
 - Saves transcript to `.opencode/architect-debates/<timestamp>.md`.
@@ -31,10 +31,10 @@ It is based on the current source code.
 - Main plugin wiring.
 - Reads config from `effectiveOpencode` or `architectPlugin` blocks in `opencode.json`.
 - Registers hooks: `config`, `permission.ask`, `event`, `experimental.chat.system.transform`, `tool.execute.before`.
-- Registers tools: `architect`, `refactor`.
+- Registers tools: `effective`, `refactor`.
 - Holds singleton `ArchitectRunScopeManager` (`scopeManager`).
 - Exposes `isAutoApprovableSession = (id) => scopeManager.isKnownSession(id)` — the **single canonical predicate** used by both `permission.ask` and `permission.updated` hooks.
-- Per architect invocation: creates a fresh `runSessions = new Set<string>()` and passes `onSessionCreated` callback to `runDebate` so scope manager drives attachment.
+- Per effective invocation: creates a fresh `runSessions = new Set<string>()` and passes `onSessionCreated` callback to `runDebate` so scope manager drives attachment.
 
 ### `src/debate-engine.ts`
 - Debate orchestration, retry/fallback model logic.
