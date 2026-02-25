@@ -22,7 +22,7 @@ const createPlugin = async (directory: string) => {
 };
 
 describe("time budget prompt scope", () => {
-  test("asks lead once, then keeps pending decision reminder", async () => {
+  test("auto-starts strict budget for explicit numeric duration", async () => {
     const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
     try {
       const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
@@ -44,8 +44,9 @@ describe("time budget prompt scope", () => {
         first,
       );
 
-      expect(first.system.join("\n")).toContain("Time Budget Confirmation Required");
-      expect(first.system.join("\n")).toContain("Pending Time Budget Decision");
+      expect(first.system.join("\n")).toContain("Active Time Budget");
+      expect(first.system.join("\n")).not.toContain("Time Budget Confirmation Required");
+      expect(first.system.join("\n")).not.toContain("Pending Time Budget Decision");
 
       const second = { system: [] as string[] };
       await plugin["experimental.chat.system.transform"]?.(
@@ -56,14 +57,14 @@ describe("time budget prompt scope", () => {
         second,
       );
 
-      expect(second.system.join("\n")).not.toContain("Time Budget Confirmation Required");
-      expect(second.system.join("\n")).toContain("Pending Time Budget Decision");
+      expect(second.system.join("\n")).toContain("Active Time Budget");
+      expect(second.system.join("\n")).not.toContain("Pending Time Budget Decision");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });
 
-  test("first prompt explicitly requires question-tool multiple choice", async () => {
+  test("numeric duration does not require question-tool confirmation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
     try {
       const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
@@ -86,9 +87,8 @@ describe("time budget prompt scope", () => {
       );
 
       const merged = output.system.join("\n");
-      expect(merged).toContain("MUST ask for an explicit two-option multiple-choice decision via the `question` tool exactly once");
-      expect(merged).toContain("Option 1: Strict deadline mode");
-      expect(merged).toContain("Option 2: Continue without strict time budget");
+      expect(merged).toContain("Active Time Budget");
+      expect(merged).not.toContain("MUST ask for an explicit two-option multiple-choice decision via the `question` tool exactly once");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -123,7 +123,7 @@ describe("time budget prompt scope", () => {
     }
   });
 
-  test("blocks tool execution until strict-mode decision is confirmed", async () => {
+  test("allows tool execution when numeric request auto-starts budget", async () => {
     const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
     try {
       const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
@@ -145,7 +145,7 @@ describe("time budget prompt scope", () => {
           },
           { args: { command: "git status" } },
         ),
-      ).rejects.toThrow("TIME_BUDGET_CONFIRMATION_REQUIRED");
+      ).resolves.toBeUndefined();
 
       await expect(
         plugin["tool.execute.before"]?.(
@@ -186,7 +186,7 @@ describe("time budget prompt scope", () => {
     }
   });
 
-  test("requires explicit approval before starting strict time budget", async () => {
+  test("start_time_budget is not blocked after explicit numeric request", async () => {
     const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
     try {
       const plugin = (await createPlugin(directory)) as Record<string, unknown>;
@@ -216,14 +216,14 @@ describe("time budget prompt scope", () => {
       };
       expect(tools.start_time_budget).toBeDefined();
 
-      const pending = await tools.start_time_budget!.execute(
+      const startedImmediately = await tools.start_time_budget!.execute(
         { minutes: 10 },
         {
           sessionID: "lead-session",
           metadata: () => {},
         },
       );
-      expect(pending).toContain("confirmation is still pending");
+      expect(startedImmediately).toContain("Time budget started for 10 minute(s)");
 
       await hooks["chat.message"]?.(
         { sessionID: "lead-session", agent: "default" },
@@ -246,7 +246,7 @@ describe("time budget prompt scope", () => {
     }
   });
 
-  test("decline response clears pending state after a numeric request", async () => {
+  test("decline response disables active strict budget", async () => {
     const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
     try {
       const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
@@ -268,7 +268,7 @@ describe("time budget prompt scope", () => {
           },
           { args: { command: "git status" } },
         ),
-      ).rejects.toThrow("TIME_BUDGET_CONFIRMATION_REQUIRED");
+      ).resolves.toBeUndefined();
 
       await plugin["chat.message"]?.(
         { sessionID: "lead-session", agent: "default" },
@@ -288,7 +288,144 @@ describe("time budget prompt scope", () => {
           { args: { command: "git status" } },
         ),
       ).resolves.toBeUndefined();
+
+      const output = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        output,
+      );
+      expect(output.system.join("\n")).not.toContain("Active Time Budget");
     } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps active strict budget across session.idle events", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "10분 동안 진행해줘" }],
+        },
+      );
+
+      const beforeIdle = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        beforeIdle,
+      );
+      expect(beforeIdle.system.join("\n")).toContain("Active Time Budget");
+
+      await plugin["event"]?.(
+        {
+          event: {
+            type: "session.idle",
+            properties: { sessionID: "lead-session" },
+          },
+        },
+        undefined as never,
+      );
+
+      const afterIdle = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        afterIdle,
+      );
+      expect(afterIdle.system.join("\n")).toContain("Active Time Budget");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("clears strict budget when session is deleted", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "10분 동안 진행해줘" }],
+        },
+      );
+
+      const beforeDelete = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        beforeDelete,
+      );
+      expect(beforeDelete.system.join("\n")).toContain("Active Time Budget");
+
+      await plugin["event"]?.(
+        {
+          event: {
+            type: "session.deleted",
+            properties: { info: { id: "lead-session" } },
+          },
+        },
+        undefined as never,
+      );
+
+      const afterDelete = { system: [] as string[] };
+      await plugin["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "lead-session",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        afterDelete,
+      );
+      expect(afterDelete.system.join("\n")).not.toContain("Active Time Budget");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("throws TIME_BUDGET_EXPIRED once approved window is exhausted", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    const originalNow = Date.now;
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        { sessionID: "lead-session", agent: "default" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "1분 동안 진행해줘" }],
+        },
+      );
+
+      const baseNow = originalNow();
+      Date.now = () => baseNow + 61_000;
+
+      await expect(
+        plugin["tool.execute.before"]?.(
+          {
+            sessionID: "lead-session",
+            tool: "bash",
+            args: { command: "git status" },
+          },
+          { args: { command: "git status" } },
+        ),
+      ).rejects.toThrow("TIME_BUDGET_EXPIRED");
+    } finally {
+      Date.now = originalNow;
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -387,7 +524,7 @@ describe("time budget prompt scope", () => {
         transformOutput,
       );
 
-      expect(transformOutput.system.join("\n")).toContain("Time Budget Confirmation Required");
+      expect(transformOutput.system.join("\n")).toContain("Active Time Budget");
 
       await expect(
         plugin["tool.execute.before"]?.(
@@ -398,13 +535,13 @@ describe("time budget prompt scope", () => {
           },
           { args: { command: "git status" } },
         ),
-      ).rejects.toThrow("TIME_BUDGET_CONFIRMATION_REQUIRED");
+      ).resolves.toBeUndefined();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });
 
-  test("e2e: 10/20 minute intent always requires one explicit decision", async () => {
+  test("e2e: explicit numeric auto-starts and decline disables strict budget", async () => {
     const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
     try {
       const plugin = (await createPlugin(directory)) as Record<string, unknown>;
@@ -433,7 +570,7 @@ describe("time budget prompt scope", () => {
         },
         confirm10,
       );
-      expect(confirm10.system.join("\n")).toContain("Time Budget Confirmation Required");
+      expect(confirm10.system.join("\n")).toContain("Active Time Budget");
 
       await expect(
         hooks["tool.execute.before"]?.(
@@ -444,7 +581,7 @@ describe("time budget prompt scope", () => {
           },
           { args: { command: "git status" } },
         ),
-      ).rejects.toThrow("TIME_BUDGET_CONFIRMATION_REQUIRED");
+      ).resolves.toBeUndefined();
 
       await hooks["chat.message"]?.(
         {
@@ -463,7 +600,7 @@ describe("time budget prompt scope", () => {
         },
         confirm20,
       );
-      expect(confirm20.system.join("\n")).toContain("Time Budget Confirmation Required");
+      expect(confirm20.system.join("\n")).toContain("Active Time Budget");
 
       await hooks["chat.message"]?.(
         { sessionID: "s-20", agent: "default" },
@@ -499,7 +636,7 @@ describe("time budget prompt scope", () => {
         },
         confirmDecline,
       );
-      expect(confirmDecline.system.join("\n")).toContain("Time Budget Confirmation Required");
+      expect(confirmDecline.system.join("\n")).toContain("Active Time Budget");
 
       await hooks["chat.message"]?.(
         { sessionID: "s-decline", agent: "default" },
@@ -519,6 +656,95 @@ describe("time budget prompt scope", () => {
           { args: { command: "git status" } },
         ),
       ).resolves.toBeUndefined();
+
+      const postDecline = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]?.(
+        {
+          sessionID: "s-decline",
+          model: { id: "openai/gpt-4o-mini", providerID: "openai", provider: "openai" },
+        },
+        postDecline,
+      );
+      expect(postDecline.system.join("\n")).not.toContain("Active Time Budget");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks effective tool outside effective agent mode", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        { sessionID: "build-session", agent: "build" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "run architecture check" }],
+        },
+      );
+
+      await expect(
+        plugin["tool.execute.before"]?.(
+          {
+            sessionID: "build-session",
+            tool: "effective",
+            args: { vision: "check architecture" },
+          },
+          { args: { vision: "check architecture" } },
+        ),
+      ).rejects.toThrow("EFFECTIVE_TOOL_RESTRICTED");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("allows effective tool in effective agent mode", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as Record<string, (input: unknown, output: unknown) => Promise<void>>;
+
+      await plugin["chat.message"]?.(
+        { sessionID: "effective-session", agent: "effective" },
+        {
+          message: {},
+          parts: [{ type: "text", text: "use effective tool" }],
+        },
+      );
+
+      await expect(
+        plugin["tool.execute.before"]?.(
+          {
+            sessionID: "effective-session",
+            tool: "effective",
+            args: { vision: "check architecture" },
+          },
+          { args: { vision: "check architecture" } },
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("injects effective and architect agents when missing", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "effective-opencode-index-test-"));
+    try {
+      const plugin = (await createPlugin(directory)) as {
+        config?: (input: unknown) => Promise<void>;
+      };
+
+      const appConfig: Record<string, unknown> = {};
+      await plugin.config?.(appConfig);
+
+      const agents = appConfig.agent as Record<string, unknown>;
+      const effective = agents.effective as Record<string, unknown>;
+      const architect = agents.architect as Record<string, unknown>;
+
+      expect(effective).toBeDefined();
+      expect(effective.mode).toBe("primary");
+      expect(architect).toBeDefined();
+      expect(architect.mode).toBe("subagent");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

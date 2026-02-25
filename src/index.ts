@@ -42,7 +42,10 @@ import { ContextAwareSkillLoader } from "./skills/index";
 // Refactoring Engine
 import { RefactorEngine } from "./refactor/index";
 import { TimeBudgetManager } from "./time-budget/manager";
-import { resolveTimeBudgetIntent } from "./time-budget/intent-parser";
+import {
+  extractTimeBudgetMinutes,
+  resolveTimeBudgetIntent,
+} from "./time-budget/intent-parser";
 
 const log = createContextLogger("plugin");
 
@@ -88,6 +91,7 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
   const approvedTimeBudgetSessions = new Set<string>();
   const nonLeadSessions = new Set<string>();
   const sessionModelContextLimit = new Map<string, number>();
+  const sessionAgentMode = new Map<string, string>();
 
   const clearTimeBudgetIntentState = (sessionID: string): void => {
     pendingTimeIntentSessions.delete(sessionID);
@@ -95,11 +99,23 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
     approvedTimeBudgetSessions.delete(sessionID);
   };
 
+  const disableStrictTimeBudget = (sessionID: string): void => {
+    timeBudgetManager.clearBudget(sessionID);
+    clearTimeBudgetIntentState(sessionID);
+  };
+
   const clearTimeBudgetSessionState = (sessionID: string): void => {
     timeBudgetManager.clearBudget(sessionID);
     clearTimeBudgetIntentState(sessionID);
     nonLeadSessions.delete(sessionID);
     sessionModelContextLimit.delete(sessionID);
+    sessionAgentMode.delete(sessionID);
+  };
+
+  const canUseEffectiveTool = (sessionID: string): boolean => {
+    if (scopeManager.isKnownSession(sessionID)) return false;
+    const mode = sessionAgentMode.get(sessionID);
+    return mode === "effective";
   };
 
   const isLeadSession = (sessionID: string, agent?: string): boolean => {
@@ -239,11 +255,7 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
   const timeBudgetManager = new TimeBudgetManager({
     config: pluginConfig.timeBudget,
     onExpired: async (sessionID: string) => {
-      log.warn("Time budget expired; aborting active session", { sessionID });
-      await ctx.client.session.abort({ path: { id: sessionID } }).catch((error: unknown) => {
-        log.warn("Failed to abort session on time-budget expiration", { sessionID, error });
-      });
-      timeBudgetManager.clearBudget(sessionID);
+      log.warn("Time budget expired; entering finalization-only mode", { sessionID });
     },
   });
 
@@ -318,17 +330,31 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
       appAuditConfig = parseAppAuditPolicy(config?.effectiveOpencode);
       legacyAuditConfig = parseAppAuditPolicy(config?.architectPlugin);
 
-      // ── Inject "architect" agent with full permissions ─────────────
-      // This is the approach used by oh-my-opencode-slim:
-      // Instead of intercepting permission.ask at runtime (unreliable for
-      // API-created sub-sessions), define an agent in the opencode config
-      // that has all permissions pre-granted. Sessions prompted with
-      // `agent: "architect"` inherit these permissions automatically.
+      // ── Inject required agents with full permissions ─────────────────
+      // This follows the same reliability idea used by oh-my-opencode-slim:
+      // for API-created sub-sessions, predefine agent permissions in config
+      // instead of relying only on runtime permission interception.
       const cfg = appConfig as Record<string, unknown>;
       if (!cfg.agent || typeof cfg.agent !== "object") {
         cfg.agent = {};
       }
       const agents = cfg.agent as Record<string, unknown>;
+      if (!agents["effective"]) {
+        agents["effective"] = {
+          name: "effective",
+          mode: "primary",
+          permission: {
+            read: "allow",
+            edit: "allow",
+            write: "allow",
+            bash: "allow",
+            webfetch: "allow",
+            doom_loop: "allow",
+            external_directory: "allow",
+          },
+        };
+        log.debug("Injected effective agent with full permissions into opencode config");
+      }
       if (!agents["architect"]) {
         agents["architect"] = {
           name: "architect",
@@ -399,11 +425,13 @@ export const EffectiveOpencodePlugin: Plugin = async (ctx: PluginInput) => {
         }
       }
 
-      // Track recently accessed files for conditional skill loading
-      if (e?.type === "session.idle" && e.properties) {
-        const props = e.properties as { sessionID?: string };
-        if (props.sessionID) {
-          clearTimeBudgetSessionState(props.sessionID);
+      // Preserve per-session time budget state across idle transitions.
+      // Cleanup is performed when the session is deleted.
+      if (e?.type === "session.deleted" && e.properties) {
+        const props = e.properties as { info?: { id?: string } };
+        const sessionID = props.info?.id;
+        if (sessionID) {
+          clearTimeBudgetSessionState(sessionID);
         }
       }
 
@@ -554,6 +582,7 @@ If the user declines strict deadline mode, proceed normally without calling \
           const remaining = formatDuration(snapshot.remainingMs);
           const elapsedPct = Math.round(snapshot.elapsedRatio * 100);
           const isFinalizing = snapshot.elapsedRatio >= pluginConfig.timeBudget.finalizingThreshold;
+          const enforceWorkWindow = snapshot.elapsedRatio < 0.7;
           output.system.push(`
 ## Active Time Budget
 
@@ -567,6 +596,7 @@ Execution policy:
 - Continue meaningful analysis/verification until near the deadline, then finalize with concise handoff.
 - Prioritize completion and correctness over optional polish.
 - If budget is nearly exhausted, finish with a concise status + remaining risks.
+${enforceWorkWindow ? "- HARD RULE: Do not send a final handoff yet. Continue analysis and tool work until at least ~70% of the approved duration has elapsed, unless the user explicitly asks to stop." : ""}
 ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool calls and finalize now." : ""}
 `);
         }
@@ -609,6 +639,10 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
       },
       output: { message: unknown; parts: unknown[] },
     ) => {
+      if (input.sessionID && input.agent && typeof input.agent === "string") {
+        sessionAgentMode.set(input.sessionID, input.agent.trim().toLowerCase());
+      }
+
       if (input.model) {
         updateLeadModel(input.model, "chat.message");
       }
@@ -645,7 +679,7 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
         .join("\n");
       const intent = resolveTimeBudgetIntent(text);
       if (input.sessionID && intent.action === "decline") {
-        clearTimeBudgetIntentState(input.sessionID);
+        disableStrictTimeBudget(input.sessionID);
       } else if (
         input.sessionID &&
         intent.action === "approve" &&
@@ -654,14 +688,25 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
       ) {
         approvedTimeBudgetSessions.add(input.sessionID);
       } else if (input.sessionID && intent.hasNumeric) {
-        const wasPending = pendingTimeIntentSessions.has(input.sessionID);
-        const wasPrompted = timeBudgetDecisionPromptedSessions.has(input.sessionID);
-        pendingTimeIntentSessions.add(input.sessionID);
-        if (wasPending && wasPrompted) {
+        const minutes = extractTimeBudgetMinutes(text);
+        if (minutes && minutes >= 1) {
+          timeBudgetManager.startBudget(input.sessionID, minutes * 60_000);
+          clearTimeBudgetIntentState(input.sessionID);
           approvedTimeBudgetSessions.add(input.sessionID);
+          log.info("Auto-started strict time budget from explicit duration request", {
+            sessionID: input.sessionID,
+            minutes,
+          });
         } else {
-          approvedTimeBudgetSessions.delete(input.sessionID);
-          timeBudgetDecisionPromptedSessions.delete(input.sessionID);
+          const wasPending = pendingTimeIntentSessions.has(input.sessionID);
+          const wasPrompted = timeBudgetDecisionPromptedSessions.has(input.sessionID);
+          pendingTimeIntentSessions.add(input.sessionID);
+          if (wasPending && wasPrompted) {
+            approvedTimeBudgetSessions.add(input.sessionID);
+          } else {
+            approvedTimeBudgetSessions.delete(input.sessionID);
+            timeBudgetDecisionPromptedSessions.delete(input.sessionID);
+          }
         }
       }
     },
@@ -673,6 +718,13 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
     ) => {
       const { tool: toolName } = input;
       const args = input.args ?? output.args;
+      if (toolName === "effective") {
+        if (!canUseEffectiveTool(input.sessionID)) {
+          throw new Error(
+            "EFFECTIVE_TOOL_RESTRICTED: The effective tool is only available in the effective agent mode. Use the effective agent to run this tool.",
+          );
+        }
+      }
       if (
         pluginConfig.timeBudget.enabled &&
         input.sessionID &&
@@ -693,7 +745,7 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
         timeBudgetManager.shouldBlockTools(input.sessionID)
       ) {
         const snapshot = timeBudgetManager.getSnapshot(input.sessionID);
-        if (snapshot?.remainingMs && snapshot.remainingMs <= 0) {
+        if (snapshot && snapshot.remainingMs <= 0) {
           throw new Error(
             "TIME_BUDGET_EXPIRED: The approved time budget is exhausted. Stop tool usage and return the best final summary immediately.",
           );
@@ -829,14 +881,90 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
           ): boolean => {
             return typeof value === "boolean" ? value : defaultValue;
           };
+
+          // Format time remaining in human-readable format
+          const formatTimeRemaining = (sec?: number): string => {
+            if (sec === undefined) return "";
+            if (sec < 60) return `${sec}s`;
+            const mins = Math.floor(sec / 60);
+            const remainingSec = sec % 60;
+            if (mins < 60) return remainingSec > 0 ? `${mins}m ${remainingSec}s` : `${mins}m`;
+            const hours = Math.floor(mins / 60);
+            const remainingMins = mins % 60;
+            return `${hours}h ${remainingMins}m`;
+          };
+
+          // Build intuitive status message with progress bar
+          const buildIntuitiveMessage = (
+            message: string,
+            progress?: {
+              currentRound: number;
+              totalRounds: number;
+              percentage: number;
+              timeBudgetRemainingSec?: number;
+              timeBudgetTotalSec?: number;
+            },
+            agentStatus?: {
+              thinking?: "proposer" | "critic";
+              waiting?: "proposer" | "critic";
+            },
+          ): string => {
+            if (!progress) return message;
+
+            // Build progress bar: [████░░░░░░] 60%
+            const barWidth = 10;
+            const normalizedPercentage = Math.min(100, Math.max(0, progress.percentage));
+            const filled = Math.round((normalizedPercentage / 100) * barWidth);
+            const empty = Math.max(0, barWidth - filled);
+            const bar = "█".repeat(filled) + "░".repeat(empty);
+            
+            // Build agent activity indicator
+            let agentIndicator = "";
+            if (agentStatus?.thinking) {
+              const thinkerName = agentStatus.thinking === "proposer" ? "Architect-1" : "Architect-2";
+              agentIndicator = ` [${thinkerName} thinking...]`;
+            } else if (agentStatus?.waiting) {
+              const waiterName = agentStatus.waiting === "proposer" ? "Architect-1" : "Architect-2";
+              agentIndicator = ` [${waiterName} waiting]`;
+            }
+
+            // Time budget display
+            let timeDisplay = "";
+            if (progress.timeBudgetRemainingSec !== undefined) {
+              timeDisplay = ` | ⏱ ${formatTimeRemaining(progress.timeBudgetRemainingSec)} left`;
+            }
+
+            // Round display
+            const roundDisplay = `R${progress.currentRound}/${progress.totalRounds}`;
+
+            return `${roundDisplay} [${bar}]${normalizedPercentage}%${timeDisplay}${agentIndicator}`;
+          };
+
           const emitArchitectVisibility = (
             event: {
               kind: string;
               message: string;
               variant?: "info" | "success" | "warning" | "error";
+              progress?: {
+                currentRound: number;
+                totalRounds: number;
+                percentage: number;
+                timeBudgetRemainingSec?: number;
+                timeBudgetTotalSec?: number;
+              };
+              agentStatus?: {
+                thinking?: "proposer" | "critic";
+                waiting?: "proposer" | "critic";
+              };
             },
           ) => {
-            emitArchitectStatus(event.message, {
+            // Build intuitive message with progress bar and agent status
+            const intuitiveMessage = buildIntuitiveMessage(
+              event.message,
+              event.progress,
+              event.agentStatus,
+            );
+            emitArchitectStatus(intuitiveMessage, {
               forceToast: event.kind !== "setup" && event.kind !== "thinking",
               variant: event.variant ?? "info",
             });
@@ -865,13 +993,40 @@ ${isFinalizing ? "- CRITICAL: You are in finalization phase. Avoid new tool call
             lastToastMessage = message;
             lastToastAt = now;
 
+            // Determine toast duration based on message type
+            // Progress updates are shorter, consensus/completion are longer
+            const isProgress = message.includes("[") && message.includes("thinking");
+            const isComplete = message.includes("consensus") || message.includes("complete") || message.includes("approved");
+            const toastDuration = isComplete ? 3500 : isProgress ? 1800 : 2500;
+
+            // Extract title from message for cleaner display
+            // Format: "R1/3 [████░░░░░] 60% | ⏱ 5m left [Architect-1 thinking...]"
+            let toastTitle = "Architects";
+            let toastMessage = message;
+
+            // If message contains round progress, use a cleaner format
+            if (message.includes("R") && message.includes("[")) {
+              // Extract just the progress part for a cleaner look
+              const progressMatch = message.match(/R(\d+)\/(\d+)\s+\[([█░]+)\]\s*(\d+)%/u);
+              if (progressMatch) {
+                toastTitle = `Round ${progressMatch[1]}/${progressMatch[2]}`;
+                toastMessage = `${progressMatch[3]} ${progressMatch[4]}%`;
+              }
+            } else if (message.includes("consensus")) {
+              toastTitle = "✓ Consensus";
+            } else if (message.includes("approved")) {
+              toastTitle = "✓ Approved";
+            } else if (message.includes("Setup")) {
+              toastTitle = "Setup";
+            }
+
             ctx.client.tui
               .showToast({
                 body: {
-                  title: "Architects",
-                  message,
+                  title: toastTitle,
+                  message: toastMessage,
                   variant: options?.variant ?? "info",
-                  duration: 2200,
+                  duration: toastDuration,
                 },
               })
               .catch((error: unknown) => {
