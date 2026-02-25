@@ -137,6 +137,26 @@ export interface DebateVisibilityEvent {
   agent?: DebateAgent;
   message: string;
   variant?: "info" | "success" | "warning" | "error";
+  /** Progress information for UI display */
+  progress?: {
+    /** Current round number (1-based) */
+    currentRound: number;
+    /** Total rounds configured */
+    totalRounds: number;
+    /** Progress percentage (0-100) */
+    percentage: number;
+    /** Time budget remaining in seconds */
+    timeBudgetRemainingSec?: number;
+    /** Time budget total in seconds */
+    timeBudgetTotalSec?: number;
+  };
+  /** Agent-specific status for UI */
+  agentStatus?: {
+    /** Agent that is currently thinking/working */
+    thinking?: DebateAgent;
+    /** Agent that is waiting */
+    waiting?: DebateAgent;
+  };
 }
 
 export interface ProtocolResult {

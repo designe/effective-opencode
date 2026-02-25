@@ -53,7 +53,7 @@ bun install
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "file://./src/index.ts"
+    "./src/index.ts"
   ],
   "effectiveOpencode": {
     "maxRounds": 3,
@@ -72,7 +72,7 @@ bun install
 opencode
 ```
 
-The `effective` and `refactor` tools are now available in your session.
+The `effective`, `refactor`, and `start_time_budget` tools are now available in your session.
 
 ## Tools
 
@@ -84,6 +84,18 @@ Runs a two-agent debate to produce an architectural design. Simply describe what
 - `vision` — your requirement or task description (required)
 - `max_rounds` — override the maximum debate rounds for this run (optional)
 - `execution_mode` — `"debate"` (default) or `"improvement-audit"`
+- `max_findings` — cap findings when using `improvement-audit` (optional)
+- `include_audit_output` — include audit summary in final response (optional)
+- `audit_profile` — `"safe" | "default" | "aggressive"` (optional)
+
+> `effective` is restricted to sessions running in `effective` agent mode. Architect sub-sessions cannot invoke it recursively.
+
+### `start_time_budget`
+
+Starts a strict execution deadline for the current session. This is intended to be used after explicit user approval (typically via a two-option confirmation step).
+
+**Parameters:**
+- `minutes` — approved duration in minutes (must be `>= 1`)
 
 **Example prompts:**
 
@@ -153,6 +165,17 @@ Each effective invocation creates a **run-scoped** pair of sub-sessions:
 
 This design prevents cross-run session bleed when multiple effective runs execute concurrently.
 
+### Time Budget Guardrails
+
+The plugin includes a session-scoped strict deadline system:
+
+1. Detects likely time-budget intent from user text (English/Korean numeric time phrases)
+2. Enforces explicit confirmation before running normal tools
+3. Requires `start_time_budget` after approval to activate strict mode
+4. Injects active budget context into system prompts and session compaction
+5. Triggers compacting when usage/progress thresholds are crossed
+6. Blocks further tool calls in finalizing/expired states and forces concise finalization
+
 ### Project Context
 
 Before the debate begins, the plugin collects context from your codebase:
@@ -188,6 +211,13 @@ All options go under `effectiveOpencode` (preferred) or `architectPlugin` in `op
 | `debateMode` | `"sequential" \| "parallel"` | `"sequential"` | Debate orchestration mode and tmux pane timing |
 | `retainSessions` | `boolean` | `false` | Keep sub-sessions after debate ends |
 | `timeoutMs` | `number` | `300000` | Per-prompt timeout in milliseconds |
+| `timeBudget.enabled` | `boolean` | `true` | Enable strict time-budget guardrails |
+| `timeBudget.finalizingThreshold` | `number` | `0.95` | Elapsed ratio where tool use is blocked |
+| `timeBudget.compactSoftThreshold` | `number` | `0.65` | Soft token-usage compact trigger |
+| `timeBudget.compactHardThreshold` | `number` | `0.82` | Hard token-usage compact trigger |
+| `timeBudget.compactCooldownMs` | `number` | `600000` | Cooldown between compact operations |
+| `timeBudget.compactProgressCheckpoints` | `number[]` | `[0.5, 0.85]` | Progress-based compact checkpoints |
+| `timeBudget.timerChunkMs` | `number` | `3600000` | Internal timer scheduling chunk size |
 | `proposerModel` | `string` | auto-detect | Model for Architect-1 |
 | `criticModel` | `string` | auto-detect | Model for Architect-2 |
 | `proposerPersona` | `string` | built-in | Custom system prompt for Architect-1 |
@@ -225,6 +255,12 @@ effective-opencode/
     ├── types.ts               # Shared TypeScript interfaces and DEFAULT_CONFIG
     ├── logger.ts              # Structured logger
     ├── model-utils.ts         # Model selection utilities
+    ├── lifecycle/             # Child-process lifecycle guard utility
+    │   └── index.ts
+    ├── time-budget/
+    │   ├── intent-parser.ts   # Time-budget intent parsing
+    │   ├── manager.ts         # Session-scoped budget lifecycle/threshold policy
+    │   └── types.ts           # Time-budget types
     ├── tmux-view.ts           # Optional live TUI via tmux split-pane
     ├── improvement-audit/
     │   ├── scope-manager.ts   # ArchitectRunScopeManager — run-scoped session tracking
@@ -254,7 +290,7 @@ bun install
 npm run build        # tsc → dist/
 
 # Run tests (targeted — avoids dist/ duplication)
-npm test             # bun test ./src/__tests__/**/*.test.ts
+npm test             # bun test ./src/__tests__/**/*.test.ts ./src/__tests__/*test.ts
 ```
 
 > Running bare `bun test` without a path glob picks up `dist/__tests__/` after a build, causing duplicate runs. Use `npm test` or target `src/__tests__/` explicitly.

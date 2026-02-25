@@ -18,7 +18,6 @@ import {
   CRITIC_PERSONA,
   buildInitialProposerPrompt,
   buildInitialCritiquePrompt,
-  buildCriticPreparationPrompt,
   buildCritiquePrompt,
   buildRevisionPrompt,
   formatFullTranscript,
@@ -570,12 +569,17 @@ export async function runDebate(
     typeof input.deadlineAt === "number" ? Math.max(0, input.deadlineAt - Date.now()) : undefined;
   const hasDeadlineWindow = typeof initialRemainingBudgetMs === "number" && initialRemainingBudgetMs > 0;
   const estimatedMinRoundMs = 4_000;
-  const budgetBoundRounds =
+  const maxRefinementWindowMs = 20_000;
+  const maxAdditionalExtensionRounds = 5;
+  const extensionDeadlineAt = hasDeadlineWindow && initialRemainingBudgetMs
+    ? Date.now() + Math.min(initialRemainingBudgetMs, maxRefinementWindowMs)
+    : undefined;
+  const budgetBoundAdditionalRounds =
     hasDeadlineWindow && initialRemainingBudgetMs
-      ? config.maxRounds + Math.ceil(initialRemainingBudgetMs / estimatedMinRoundMs)
-      : config.maxRounds;
+      ? Math.max(1, Math.ceil(initialRemainingBudgetMs / estimatedMinRoundMs))
+      : 0;
   const maxExtendedRounds = hasDeadlineWindow
-    ? Math.max(config.maxRounds + 24, config.maxRounds * 3, budgetBoundRounds)
+    ? config.maxRounds + Math.min(maxAdditionalExtensionRounds, budgetBoundAdditionalRounds)
     : config.maxRounds;
   const getRemainingBudgetMs = (): number | undefined => {
     if (!input.deadlineAt) return undefined;
@@ -587,6 +591,9 @@ export async function runDebate(
     }
     const remaining = getRemainingBudgetMs();
     if (remaining === undefined || remaining <= 0) {
+      return false;
+    }
+    if (extensionDeadlineAt && Date.now() >= extensionDeadlineAt) {
       return false;
     }
     const elapsedRatio = Math.min(1, Math.max(0, 1 - remaining / initialRemainingBudgetMs));
@@ -678,6 +685,37 @@ export async function runDebate(
   let activeRound = 0;
   let lastLiveStatus = "";
   let lastLiveStatusAt = 0;
+  let currentThinkingAgent: DebateAgent | undefined;
+  let currentWaitingAgent: DebateAgent | undefined;
+
+  // Calculate progress percentage based on round and time budget
+  const calculateProgress = (round: number): DebateVisibilityEvent["progress"] => {
+    const currentRound = Math.max(1, round);
+    const totalRounds = Math.max(1, config.maxRounds);
+    // Calculate round-based progress (60%) + time-based progress (40%)
+    const roundProgress = Math.min(60, Math.round((currentRound / totalRounds) * 60));
+    
+    // Add time budget progress if available
+    const remainingBudgetMs = getRemainingBudgetMs();
+    let timeProgress = 0;
+    let timeBudgetRemainingSec: number | undefined;
+    let timeBudgetTotalSec: number | undefined;
+    
+    if (remainingBudgetMs !== undefined && remainingBudgetMs > 0 && initialRemainingBudgetMs) {
+      timeBudgetRemainingSec = Math.round(remainingBudgetMs / 1000);
+      timeBudgetTotalSec = Math.round(initialRemainingBudgetMs / 1000);
+      timeProgress = Math.min(40, Math.round((1 - remainingBudgetMs / initialRemainingBudgetMs) * 40));
+    }
+    
+    return {
+      currentRound,
+      totalRounds,
+      percentage: Math.min(100, roundProgress + timeProgress),
+      timeBudgetRemainingSec,
+      timeBudgetTotalSec,
+    };
+  };
+
   const emitLiveStatus = (
     status: string,
     kind: DebateVisibilityEvent["kind"],
@@ -693,6 +731,9 @@ export async function runDebate(
     }
     lastLiveStatus = status;
     lastLiveStatusAt = now;
+    
+    const progress = round ? calculateProgress(round) : undefined;
+    
     emitVisibility(
       {
         kind,
@@ -700,6 +741,11 @@ export async function runDebate(
         agent,
         round,
         variant,
+        progress,
+        agentStatus: {
+          thinking: currentThinkingAgent,
+          waiting: currentWaitingAgent,
+        },
       },
       force,
     );
@@ -711,6 +757,23 @@ export async function runDebate(
     round?: number,
     kind: DebateVisibilityEvent["kind"] = "thinking",
   ) => {
+    // Update thinking/waiting state based on status
+    const isThinking = status.includes("...") || status.includes("in progress") || status.includes("starting");
+    const isCompleted = status.includes("completed") || status.includes("confirmed");
+    const isWaiting = status.includes("waiting");
+    
+    if (isThinking) {
+      currentThinkingAgent = agent;
+      currentWaitingAgent = agent === "proposer" ? "critic" : "proposer";
+    } else if (isCompleted || isWaiting) {
+      currentThinkingAgent = undefined;
+      if (isWaiting) {
+        currentWaitingAgent = agent;
+      } else {
+        currentWaitingAgent = undefined;
+      }
+    }
+    
     const next = `${formatRound(round ?? activeRound)}: ${getAgentLabel(agent)} ${status}`;
     if (logAsInfo) {
       log.info(next);
@@ -879,93 +942,41 @@ export async function runDebate(
     // ── 2. Start proposer work and initialize tmux view ─
     // In sequential mode, only proposer pane is opened at first.
     // Critic pane is opened right before critique begins.
-    // In parallel mode, both panes open immediately and critic prep runs in parallel.
+    // In parallel mode, both panes open immediately.
     log.debug("Launching initial debate setup", { debateMode });
     activeRound = 1;
     if ((getRemainingBudgetMs() ?? Number.POSITIVE_INFINITY) <= 0) {
       throw new Error("Debate cancelled by user: parent session time budget expired");
     }
-    let criticPreparation = "";
     let initialProposal = "";
 
-    if (debateMode === "parallel") {
-      const criticPreparationTask = promptWithProgress({
-        agent: "critic",
-        sessionID: sessions.critic,
-        promptText: buildCriticPreparationPrompt(criticPersona, projectContext, vision),
+    const [tmuxResult, proposalResult] = await Promise.all([
+      createTmuxDebateView({
+        $: ctx.$,
+        proposerSessionId: sessions.proposer,
+        criticSessionId: sessions.critic,
+        proposerModel: proposerModelString,
+        criticModel: criticModelString,
+        serverUrl: input.serverUrl,
+        createCriticPane: debateMode === "parallel",
+      }),
+      promptWithProgress({
+        agent: "proposer",
+        sessionID: sessions.proposer,
+        promptText: buildInitialProposerPrompt(proposerPersona, projectContext, vision),
         timeoutMs: resolveTimeoutMs(),
-        model: criticModel,
+        model: proposerModel,
         leadModel: config.leadModel,
-        round: 0,
-        phase: "preparing review plan",
-      }).catch((err) => {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (errMsg.includes("cancelled by user") || errMsg.includes("timed out")) {
-          throw err;
-        }
-        log.warn("Critic preparation failed; continuing without prep context", { error: errMsg });
-        setLiveStatus("critic", "prep skipped, will critique proposal", true, 0, "thinking");
-        return "";
-      });
-
-      const [tmuxResult, proposalResult, prepResult] = await Promise.all([
-        createTmuxDebateView({
-          $: ctx.$,
-          proposerSessionId: sessions.proposer,
-          criticSessionId: sessions.critic,
-          proposerModel: proposerModelString,
-          criticModel: criticModelString,
-          serverUrl: input.serverUrl,
-          createCriticPane: true,
-        }),
-        promptWithProgress({
-          agent: "proposer",
-          sessionID: sessions.proposer,
-          promptText: buildInitialProposerPrompt(proposerPersona, projectContext, vision),
-          timeoutMs: resolveTimeoutMs(),
-          model: proposerModel,
-          leadModel: config.leadModel,
-          round: 1,
-          phase: "drafting initial proposal",
-        }),
-        criticPreparationTask,
-      ]);
-      tmuxView = tmuxResult;
-      initialProposal = proposalResult;
-      criticPreparation = prepResult;
-    } else {
-      const [tmuxResult, proposalResult] = await Promise.all([
-        createTmuxDebateView({
-          $: ctx.$,
-          proposerSessionId: sessions.proposer,
-          criticSessionId: sessions.critic,
-          proposerModel: proposerModelString,
-          criticModel: criticModelString,
-          serverUrl: input.serverUrl,
-          createCriticPane: false,
-        }),
-        promptWithProgress({
-          agent: "proposer",
-          sessionID: sessions.proposer,
-          promptText: buildInitialProposerPrompt(proposerPersona, projectContext, vision),
-          timeoutMs: resolveTimeoutMs(),
-          model: proposerModel,
-          leadModel: config.leadModel,
-          round: 1,
-          phase: "drafting initial proposal",
-        }),
-      ]);
-      tmuxView = tmuxResult;
-      initialProposal = proposalResult;
-    }
+        round: 1,
+        phase: "drafting initial proposal",
+      }),
+    ]);
+    tmuxView = tmuxResult;
+    initialProposal = proposalResult;
 
     setLiveStatus("proposer", "submitted initial proposal", true, 1, "thinking");
     setLiveStatus("critic", "waiting to review initial proposal", true, 1, "thinking");
-    notify(
-      debateMode === "parallel"
-        ? "Round 1 proposal draft and preparation completed"
-        : "Round 1 proposal draft completed",
-    );
+    notify("Round 1 proposal draft completed");
 
     if (tmuxView) {
       emitVisibility({
@@ -1081,10 +1092,6 @@ export async function runDebate(
               proposal,
             )
           : buildCritiquePrompt(proposal, i + 1, config.maxRounds);
-      if (i === 0 && criticPreparation.trim()) {
-        critiquePrompt += `\n\n## Prior Review Notes (Prepared Earlier)\n${criticPreparation}\n\nUse these notes as guidance while evaluating the proposal.`;
-      }
-
       let critique = await promptWithProgress({
         agent: "critic",
         sessionID: sessions.critic,

@@ -3,10 +3,20 @@ import { logger, createContextLogger } from "../logger";
 
 describe("logger", () => {
   const originalEnv = process.env.OPENCODE_LOG_LEVEL;
+  const originalConsole = {
+    debug: console.debug,
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+  };
 
   beforeEach(() => {
     // Reset env
     delete process.env.OPENCODE_LOG_LEVEL;
+    console.debug = mock(() => {});
+    console.info = mock(() => {});
+    console.warn = mock(() => {});
+    console.error = mock(() => {});
   });
 
   afterEach(() => {
@@ -16,6 +26,10 @@ describe("logger", () => {
     } else {
       delete process.env.OPENCODE_LOG_LEVEL;
     }
+    console.debug = originalConsole.debug;
+    console.info = originalConsole.info;
+    console.warn = originalConsole.warn;
+    console.error = originalConsole.error;
   });
 
   test("should create context logger", () => {

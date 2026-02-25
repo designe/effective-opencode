@@ -163,12 +163,12 @@ export async function createTmuxDebateView(
     const reachable = await isServerReachable(attachServerUrl);
     if (!reachable) {
       log.warn(
-        "Server URL is unreachable; skipping tmux attach view. " +
+        "Server URL is unreachable; falling back to local session mode for tmux panes. " +
         "Run opencode with an explicit listening port (for example `opencode --port 4096`) " +
-        "to enable live pane attachment.",
+        "to enable live attach mode.",
         { serverUrl: attachServerUrl },
       );
-      return null;
+      attachServerUrl = undefined;
     }
   }
 

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -195,6 +195,7 @@ describe("debate-engine visibility callbacks", () => {
     TMUX: process.env.TMUX,
     TMUX_PANE: process.env.TMUX_PANE,
   };
+  const originalConsoleError = console.error;
   const config: PluginConfig = {
     ...DEFAULT_CONFIG,
     debateMode: "parallel",
@@ -209,7 +210,7 @@ describe("debate-engine visibility callbacks", () => {
     const calls: SessionCreateBody[] = [];
     const client = createMockDebateClient({
       proposer: [toolCtx.proposal],
-      critic: ["Prep notes", toolCtx.verdict],
+      critic: [toolCtx.verdict],
       onCreate: (body) => {
         calls.push(body);
       },
@@ -246,6 +247,7 @@ describe("debate-engine visibility callbacks", () => {
   afterEach(async () => {
     process.env.TMUX = originalEnv.TMUX;
     process.env.TMUX_PANE = originalEnv.TMUX_PANE;
+    console.error = originalConsoleError;
     await Promise.all(
       tempDirs.map((dir) => rm(dir, { recursive: true, force: true }).catch(() => {})),
     );
@@ -255,12 +257,13 @@ describe("debate-engine visibility callbacks", () => {
   beforeEach(() => {
     delete process.env.TMUX;
     delete process.env.TMUX_PANE;
+    console.error = mock(() => {});
   });
 
   test("uses onVisibility and ignores onStatus when both exist", async () => {
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
-      critic: ["Prep notes", verdict],
+      critic: [verdict],
     });
     const directory = await mkWorkingDir();
     tempDirs.push(directory);
@@ -302,7 +305,7 @@ describe("debate-engine visibility callbacks", () => {
   test("emits one terminal event on successful debate completion", async () => {
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
-      critic: ["Prep notes", verdict],
+      critic: [verdict],
     });
     const directory = await mkWorkingDir();
     tempDirs.push(directory);
@@ -343,7 +346,6 @@ describe("debate-engine visibility callbacks", () => {
         "Refined proposal C",
       ],
       critic: [
-        "Prep notes",
         verdict,
         verdict,
         verdict,
@@ -373,11 +375,73 @@ describe("debate-engine visibility callbacks", () => {
     expect(result.rounds.some((round) => round.proposal !== "Initial proposal draft")).toBe(true);
   });
 
+  test("caps progress percentage at 100 during extended rounds", async () => {
+    const client = createMockDebateClient({
+      proposer: ["Initial proposal draft", "Refined proposal A"],
+      critic: [rejectedVerdict, verdict],
+      criticPromptDelayByCallMs: [900, 900],
+    });
+    const directory = await mkWorkingDir();
+    tempDirs.push(directory);
+
+    const percentages: number[] = [];
+
+    const result = await runDebate(client, {
+      directory,
+      $: mkShell() as unknown as never,
+    }, {
+      parentSessionID: "parent",
+      vision: "Keep progress bounded while extending rounds",
+      projectContext: "Project context",
+      config,
+      abort: new AbortController().signal,
+      deadlineAt: Date.now() + 2_500,
+      architectSessions: new Set(),
+      onRound: () => {},
+      onVisibility: (event) => {
+        if (event.progress) {
+          percentages.push(event.progress.percentage);
+        }
+      },
+    });
+
+    expect(result.consensus).toBe(true);
+    expect(result.rounds.length).toBeGreaterThanOrEqual(2);
+    expect(percentages.length).toBeGreaterThan(0);
+    expect(percentages.every((value) => value >= 0 && value <= 100)).toBe(true);
+  });
+
+  test("caps extended rounds under active time budget", async () => {
+    const client = createMockDebateClient({
+      proposer: ["Initial proposal draft"],
+      critic: [verdict],
+    });
+    const directory = await mkWorkingDir();
+    tempDirs.push(directory);
+
+    const result = await runDebate(client, {
+      directory,
+      $: mkShell() as unknown as never,
+    }, {
+      parentSessionID: "parent",
+      vision: "Bound extension rounds while budget is active",
+      projectContext: "Project context",
+      config,
+      abort: new AbortController().signal,
+      deadlineAt: Date.now() + 60_000,
+      architectSessions: new Set(),
+      onRound: () => {},
+    });
+
+    expect(result.consensus).toBe(true);
+    expect(result.rounds).toHaveLength(6);
+  });
+
   test("finishes the active round even if deadline expires mid-round", async () => {
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
-      critic: ["Prep notes", rejectedVerdict],
-      criticPromptDelayByCallMs: [0, 1_200],
+      critic: [rejectedVerdict],
+      criticPromptDelayByCallMs: [1_200],
     });
     const directory = await mkWorkingDir();
     tempDirs.push(directory);
@@ -404,7 +468,7 @@ describe("debate-engine visibility callbacks", () => {
   test("emits one terminal event when max rounds are reached", async () => {
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
-      critic: ["Prep notes", rejectedVerdict],
+      critic: [rejectedVerdict],
     });
     const directory = await mkWorkingDir();
     tempDirs.push(directory);
@@ -437,7 +501,7 @@ describe("debate-engine visibility callbacks", () => {
   test("retries low-quality critique once and reports retry usage", async () => {
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
-      critic: ["Prep notes", "Planning detailed architecture design", verdict],
+      critic: ["Planning detailed architecture design", verdict],
     });
     const directory = await mkWorkingDir();
     tempDirs.push(directory);
@@ -493,7 +557,7 @@ describe("debate-engine visibility callbacks", () => {
   test("survives failing onVisibility callbacks", async () => {
     const client = createMockDebateClient({
       proposer: ["Resilient proposal"],
-      critic: ["Prep notes", verdict],
+      critic: [verdict],
     });
     const directory = await mkWorkingDir();
     tempDirs.push(directory);
@@ -541,7 +605,7 @@ describe("debate-engine visibility callbacks", () => {
   test("registers architect sessions through callback and cleans compatibility set", async () => {
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
-      critic: ["Prep notes", verdict],
+      critic: [verdict],
     });
     const directory = await mkWorkingDir();
     tempDirs.push(directory);
@@ -576,7 +640,7 @@ describe("debate-engine visibility callbacks", () => {
     const deletedSessions: string[] = [];
     const client = createMockDebateClient({
       proposer: ["Initial proposal draft"],
-      critic: ["Prep notes", verdict],
+      critic: [verdict],
       onDelete: (sessionID) => {
         deletedSessions.push(sessionID);
       },
